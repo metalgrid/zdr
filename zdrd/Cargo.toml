@@ -1,0 +1,14 @@
+[package]
+name = "zdrd"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+clap = { version = "4.5.1", features = ["derive"] }
+dlib-face-recognition = { version = "0.3.2", features = ["openblas"] }
+event-listener = "5.1.0"
+image = "0.24.9"
+v4l = "0.14.0"
+zbus = "4.1.1"
