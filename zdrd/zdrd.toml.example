@@ -1,0 +1,27 @@
+# zdrd configuration — copy to /etc/zdr/zdrd.toml and edit.
+# Every key is optional. Precedence: CLI flag > this file > built-in default.
+# A present but invalid file makes the daemon refuse to start.
+
+# RGB camera device (e.g. /dev/v4l/by-path/...), or "auto" to detect.
+#rgb_camera = "auto"
+
+# IR camera device (e.g. /dev/v4l/by-path/...), or "auto" to detect.
+#ir_camera = "auto"
+
+# WARNING: setting require_ir = false selects RGB-only mode.
+# A printed photo or a photo on a phone screen can pass in this mode.
+# It is convenience only, not secure authentication. Keep this true
+# (the default) unless you accept that risk.
+#require_ir = true
+
+# Cosine-similarity match threshold.
+#threshold = 0.363
+
+# Directory holding per-user templates: <auth_dir>/<user>/templates.bin
+#auth_dir = "/var/lib/zdr"
+
+# Path to the YuNet face-detection ONNX model.
+#yunet = "/usr/share/zdr/models/face_detection_yunet_2023mar.onnx"
+
+# Path to the SFace face-recognition ONNX model.
+#sface = "/usr/share/zdr/models/face_recognition_sface_2021dec.onnx"
