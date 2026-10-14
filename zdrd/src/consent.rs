@@ -274,7 +274,7 @@ impl Consent {
             .requests
             .get_mut(request_id)
             .ok_or(ConsentError::Unknown)?;
-        if req.state == State::Awaiting && now >= req.expires_at {
+        if matches!(req.state, State::Awaiting | State::Approved) && now >= req.expires_at {
             req.state = State::Expired;
         }
         Ok(match req.state {
@@ -296,7 +296,7 @@ impl Consent {
             .requests
             .get_mut(request_id)
             .ok_or(ConsentError::Unknown)?;
-        if req.state == State::Awaiting && now >= req.expires_at {
+        if matches!(req.state, State::Awaiting | State::Approved) && now >= req.expires_at {
             req.state = State::Expired;
         }
         match req.state {
@@ -336,13 +336,14 @@ impl Consent {
         let expired = match self.requests.get(&id) {
             Some(req) => {
                 matches!(req.state, State::Expired | State::Denied)
-                    || (req.state == State::Awaiting && now >= req.expires_at)
+                    || (matches!(req.state, State::Awaiting | State::Approved)
+                        && now >= req.expires_at)
             }
             None => true,
         };
         if expired {
             if let Some(req) = self.requests.get_mut(&id) {
-                if req.state == State::Awaiting {
+                if matches!(req.state, State::Awaiting | State::Approved) {
                     req.state = State::Expired;
                 }
             }
