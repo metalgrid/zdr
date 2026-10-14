@@ -32,6 +32,14 @@ const AWAIT_CONSENT_TIMEOUT: Duration = Duration::from_secs(35);
 const CAPTURE_VERIFY_TIMEOUT: Duration = Duration::from_secs(15);
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Log a failure reason to stderr and return PAM_AUTH_ERR. The module must
+/// never fail silently: under pamtester/sudo this lands on the terminal, and
+/// under a display manager it lands in the journal via the service.
+fn fail(context: &str, error: &str) -> PamResultCode {
+    eprintln!("pam_zdr: {context}: {error}");
+    PamResultCode::PAM_AUTH_ERR
+}
+
 struct PamZdr;
 pam::pam_hooks!(PamZdr);
 
@@ -48,7 +56,7 @@ impl PamHooks for PamZdr {
         let remote = match pamh.get_item::<RHost>() {
             Ok(Some(host)) => !host.0.to_bytes().is_empty(),
             Ok(None) => false,
-            Err(_) => return PamResultCode::PAM_AUTH_ERR,
+            Err(code) => return fail("reading PAM_RHOST", &format!("{code:?}")),
         };
         if remote {
             return PamResultCode::PAM_AUTH_ERR;
@@ -68,7 +76,7 @@ impl PamHooks for PamZdr {
         // lets the password fallback run.
         let (connection, request_id, channel) = match call_begin_auth(user, service, tty, label) {
             Ok(parts) => parts,
-            Err(_) => return PamResultCode::PAM_AUTH_ERR,
+            Err(e) => return fail("BeginAuth", &e),
         };
         // From here on BeginAuth has succeeded: any error path cancels the
         // request best-effort before returning.
@@ -88,12 +96,12 @@ impl PamHooks for PamZdr {
                         Some(consent) => finish(&connection, &request_id, consent),
                         None => {
                             cancel_best_effort(&connection, &request_id);
-                            PamResultCode::PAM_AUTH_ERR
+                            fail("AwaitConsent", "unknown outcome string")
                         }
                     },
-                    Err(_) => {
+                    Err(e) => {
                         cancel_best_effort(&connection, &request_id);
-                        PamResultCode::PAM_AUTH_ERR
+                        fail("AwaitConsent", &e)
                     }
                 }
             }
@@ -108,22 +116,26 @@ impl PamHooks for PamZdr {
                     // "no" all mean no. Tell the daemon (best-effort) and
                     // fail so the password prompt follows. No capture may
                     // happen without a yes.
-                    if call_respond(&connection, &request_id, false).is_err() {
+                    if let Err(e) = call_respond(&connection, &request_id, false) {
+                        eprintln!("pam_zdr: Respond(false): {e}");
                         cancel_best_effort(&connection, &request_id);
                     }
                     return PamResultCode::PAM_AUTH_ERR;
                 }
-                if call_respond(&connection, &request_id, true).is_err() {
+                if let Err(e) = call_respond(&connection, &request_id, true) {
                     cancel_best_effort(&connection, &request_id);
-                    return PamResultCode::PAM_AUTH_ERR;
+                    return fail("Respond(true)", &e);
                 }
                 // The daemon records Respond(true) as approval; capturing is
                 // the next and only remaining step.
                 finish(&connection, &request_id, Consent::Approved)
             }
-            _ => {
+            other => {
                 cancel_best_effort(&connection, &request_id);
-                PamResultCode::PAM_AUTH_ERR
+                fail(
+                    "BeginAuth channel",
+                    &format!("unexpected channel {other:?}"),
+                )
             }
         }
     }
@@ -167,8 +179,12 @@ fn finish(connection: &Connection, request_id: &str, consent: Consent) -> PamRes
         return decide(&consent, None);
     }
     match call_capture_verify(connection, request_id) {
-        Ok((matched, _reason)) => decide(&consent, Some(matched)),
-        Err(_) => {
+        Ok((matched, reason)) => {
+            eprintln!("pam_zdr: CaptureVerify matched={matched} reason={reason}");
+            decide(&consent, Some(matched))
+        }
+        Err(e) => {
+            eprintln!("pam_zdr: CaptureVerify: {e}");
             cancel_best_effort(connection, request_id);
             decide(&consent, None)
         }
