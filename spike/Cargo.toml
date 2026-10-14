@@ -1,0 +1,19 @@
+# Standalone spike crate. Its own empty [workspace] table detaches it from
+# the repository root workspace so the root Cargo.toml stays untouched.
+[workspace]
+
+[package]
+name = "zdr-spike"
+version = "0.1.0"
+edition = "2021"
+description = "Phase 0 spike: YuNet + SFace ONNX pipeline on RGB + IR cameras"
+license = "MIT"
+
+[dependencies]
+ort = "=2.0.0-rc.14"
+clap = { version = "4", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+v4l = "0.14"
+
+[profile.release]
+debug = false
