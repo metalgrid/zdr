@@ -17,6 +17,7 @@ pub const DEFAULT_SFACE: &str = "/usr/share/zdr/models/face_recognition_sface_20
 pub const DEFAULT_AUTH_DIR: &str = "/var/lib/zdr";
 pub const DEFAULT_THRESHOLD: f32 = 0.363;
 pub const DEFAULT_REQUIRE_IR: bool = true;
+pub const DEFAULT_TPM_PCRS: &str = "7";
 
 /// Parsed `/etc/zdr/zdrd.toml`. Every key is optional; `None` means
 /// "not set in the file". Unknown keys are rejected so typos fail
@@ -31,6 +32,7 @@ pub struct FileConfig {
     pub auth_dir: Option<PathBuf>,
     pub yunet: Option<PathBuf>,
     pub sface: Option<PathBuf>,
+    pub tpm_pcrs: Option<String>,
 }
 
 /// Load the config file. Missing file => `Ok(None)`; present but
@@ -67,6 +69,10 @@ pub struct ResolvedConfig {
     pub auth_dir: PathBuf,
     pub yunet: PathBuf,
     pub sface: PathBuf,
+    /// TPM PCRs the sealed password is bound to (`tpm_pcrs` key).
+    /// Default `"7"`; empty string means no PCR binding (the
+    /// `--tpm2-pcrs` flag is omitted — see `seal` module docs).
+    pub tpm_pcrs: String,
 }
 
 /// The camera spec before detection: `Some(path)` for an explicit
@@ -116,6 +122,10 @@ impl ResolvedConfig {
                 .clone()
                 .or_else(|| file.sface.clone())
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_SFACE)),
+            tpm_pcrs: file
+                .tpm_pcrs
+                .clone()
+                .unwrap_or_else(|| DEFAULT_TPM_PCRS.to_string()),
         }
     }
 
@@ -163,6 +173,18 @@ mod tests {
         assert_eq!(r.auth_dir, PathBuf::from(DEFAULT_AUTH_DIR));
         assert_eq!(r.yunet, PathBuf::from(DEFAULT_YUNET));
         assert_eq!(r.sface, PathBuf::from(DEFAULT_SFACE));
+        assert_eq!(r.tpm_pcrs, DEFAULT_TPM_PCRS);
+    }
+
+    #[test]
+    fn tpm_pcrs_from_file_including_empty() {
+        let file: FileConfig = toml::from_str("tpm_pcrs = \"7+11\"\n").expect("parse file config");
+        let r = ResolvedConfig::resolve(&args(), &file, &detected());
+        assert_eq!(r.tpm_pcrs, "7+11");
+        // Empty string is meaningful: no PCR binding.
+        let file: FileConfig = toml::from_str("tpm_pcrs = \"\"\n").expect("parse empty");
+        let r = ResolvedConfig::resolve(&args(), &file, &detected());
+        assert_eq!(r.tpm_pcrs, "");
     }
 
     #[test]

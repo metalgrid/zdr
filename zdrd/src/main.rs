@@ -8,6 +8,7 @@ mod engine;
 mod enroll;
 mod error;
 mod feedback;
+mod seal;
 mod service;
 mod templates;
 mod verify;
@@ -48,6 +49,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("zdrd:   auth-dir: {}", cfg.auth_dir.display());
     eprintln!("zdrd:   yunet: {}", cfg.yunet.display());
     eprintln!("zdrd:   sface: {}", cfg.sface.display());
+    eprintln!(
+        "zdrd:   tpm-pcrs: {}",
+        if cfg.tpm_pcrs.is_empty() {
+            "(none)"
+        } else {
+            cfg.tpm_pcrs.as_str()
+        }
+    );
+    if !seal::valid_pcrs(&cfg.tpm_pcrs) {
+        return Err(Box::<dyn std::error::Error>::from(crate::error::DaemonError::Invalid(
+            format!(
+                "invalid tpm_pcrs {:?} in config (want e.g. \"7\", \"7+11\", or \"\" for no PCR binding)",
+                cfg.tpm_pcrs
+            ),
+        )));
+    }
     if !cfg.require_ir {
         eprintln!("zdrd: WARNING: RGB-only mode (require_ir=false)");
         eprintln!(
