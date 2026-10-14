@@ -86,15 +86,6 @@ pub fn capture_paired(rgb_path: &str, ir_path: &str) -> Result<PairedCapture> {
     Ok(PairedCapture { rgb, ir })
 }
 
-
-pub fn mean_brightness_gray(img: &GrayImage) -> f64 {
-    if img.width() == 0 || img.height() == 0 {
-        return 0.0;
-    }
-    let sum: u64 = img.pixels().map(|p| p[0] as u64).sum();
-    sum as f64 / img.pixels().count() as f64
-}
-
 /// Replicate a grayscale image into 3 RGB channels (for SFace on IR).
 pub fn gray_to_rgb(img: &GrayImage) -> RgbImage {
     RgbImage::from_fn(img.width(), img.height(), |x, y| {

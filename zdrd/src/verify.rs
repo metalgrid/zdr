@@ -142,7 +142,10 @@ pub fn verify_images(
         .iter()
         .map(|t| align::cosine(&emb.vector, t))
         .fold(f32::MIN, f32::max);
-    eprintln!("zdrd: verify best cosine={best:.4} threshold={threshold}");
+    eprintln!(
+        "zdrd: verify best cosine={best:.4} threshold={threshold} raw_norm={:.3}",
+        emb.raw_norm
+    );
     if best >= threshold {
         (true, "match".to_string())
     } else {
