@@ -254,10 +254,10 @@ fn cmd_list(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
     for dir in users {
-        let name = dir
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| dir.display().to_string());
+        let name = match dir.file_name() {
+            Some(n) => n.to_string_lossy().into_owned(),
+            None => dir.display().to_string(),
+        };
         let bin = dir.join("templates.bin");
         match std::fs::read(&bin) {
             Ok(bytes) => match count_templates(&bytes) {
@@ -289,7 +289,10 @@ fn cmd_remove(args: &[String]) -> Result<(), String> {
     std::io::stdout()
         .flush()
         .map_err(|e| format!("flushing stdout: {e}"))?;
-    let answer = read_line_from_stdin()?.unwrap_or_default();
+    let answer = match read_line_from_stdin()? {
+        Some(line) => line,
+        None => String::new(),
+    };
     let answer = answer.trim().to_ascii_lowercase();
     if answer != "y" && answer != "yes" {
         println!("Aborted.");
@@ -304,14 +307,13 @@ fn cmd_remove(args: &[String]) -> Result<(), String> {
     let rd = std::fs::read_dir(dir).map_err(|e| format!("reading {}: {e}", dir.display()))?;
     for entry in rd.filter_map(|e| e.ok()) {
         let path = entry.path();
-        let is_png_template = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| {
+        let is_png_template = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => {
                 let n = n.to_ascii_lowercase();
                 n.starts_with("ir") && n.ends_with(".png")
-            })
-            .unwrap_or(false);
+            }
+            None => false,
+        };
         if is_png_template {
             std::fs::remove_file(&path).map_err(|e| format!("removing {}: {e}", path.display()))?;
             removed += 1;
