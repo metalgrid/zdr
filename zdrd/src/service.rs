@@ -233,7 +233,13 @@ impl Authenticator {
             let outcome = self.lock_consent()?.outcome(request_id, Instant::now());
             match outcome {
                 Ok(Some(outcome)) => return Ok(outcome.as_str().to_string()),
-                Ok(None) => tokio::time::sleep(Duration::from_millis(50)).await,
+                // NOTE: no tokio::time here. zbus runs this handler on its
+                // own executor thread without a Tokio reactor context;
+                // tokio::time::sleep panics there (seen live 2026-10-14).
+                // async-io's Timer runs on its own reactor and works.
+                Ok(None) => {
+                    async_io::Timer::after(Duration::from_millis(50)).await;
+                }
                 Err(ConsentError::Unknown) => return Ok("expired".to_string()),
                 Err(e) => return Err(e.into()),
             }
@@ -262,28 +268,45 @@ impl Authenticator {
                 Err(e) => return Err(e.into()),
             }
         };
-        // Capture + inference is blocking (cameras, ONNX): keep it off the
-        // async runtime and bound it with a hard timeout. No capture of any
-        // kind happens before this point.
+        // Capture + inference is blocking (cameras, ONNX): run it on a
+        // plain thread and poll for the result with a hard deadline. No
+        // tokio APIs here either (see AwaitConsent note): tokio::task and
+        // tokio::time panic on the zbus executor thread. A thread that
+        // outlives the deadline cannot be killed; it holds the cameras
+        // until it returns, and the next attempt then fails closed.
         let verifier = Arc::clone(&self.verifier);
         let capture_user = user.clone();
-        let capture = tokio::task::spawn_blocking(move || verifier.verify(&capture_user));
-        match tokio::time::timeout(CAPTURE_TIMEOUT, capture).await {
-            Ok(Ok(result)) => {
-                eprintln!(
-                    "zdrd: CaptureVerify user={user} matched={} reason={}",
-                    result.0, result.1
-                );
-                Ok(result)
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("zdrd-capture".to_string())
+            .spawn(move || {
+                let _ = tx.send(verifier.verify(&capture_user));
+            });
+        if let Err(e) = spawned {
+            eprintln!("zdrd: CaptureVerify spawn failed for user={user}: {e}");
+            return Ok((false, "engine".to_string()));
+        }
+        let deadline = Instant::now() + CAPTURE_TIMEOUT;
+        loop {
+            match rx.try_recv() {
+                Ok(result) => {
+                    eprintln!(
+                        "zdrd: CaptureVerify user={user} matched={} reason={}",
+                        result.0, result.1
+                    );
+                    return Ok(result);
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    eprintln!("zdrd: CaptureVerify worker stopped for user={user}");
+                    return Ok((false, "engine".to_string()));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
-            Ok(Err(e)) => {
-                eprintln!("zdrd: CaptureVerify worker failed for user={user}: {e}");
-                Ok((false, "engine".to_string()))
-            }
-            Err(_) => {
+            if Instant::now() >= deadline {
                 eprintln!("zdrd: CaptureVerify timed out for user={user}");
-                Ok((false, "camera".to_string()))
+                return Ok((false, "camera".to_string()));
             }
+            async_io::Timer::after(Duration::from_millis(25)).await;
         }
     }
 
