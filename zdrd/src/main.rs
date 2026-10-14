@@ -61,15 +61,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let verifier = FaceVerifier::new(
         engine,
         cfg.auth_dir.clone(),
-        cfg.rgb_camera
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default(),
-        cfg.ir_camera
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default(),
+        cfg.rgb_camera.clone(),
+        cfg.ir_camera.clone(),
         cfg.threshold,
+        cfg.require_ir,
     );
     let svc = Authenticator::new(Arc::new(verifier));
     let _conn = zbus::connection::Builder::system()?
