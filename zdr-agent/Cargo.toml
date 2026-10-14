@@ -5,11 +5,6 @@ edition = "2021"
 description = "Per-session agent for zdr face authentication prompts"
 license = "MIT"
 
-# Standalone workspace so this lane builds independently of the root
-# workspace. Removed when the crate is wired into the root workspace
-# at integration time.
-[workspace]
-
 [dependencies]
 libc = "0.2"
 zbus = { version = "4.1.1", features = ["blocking"] }

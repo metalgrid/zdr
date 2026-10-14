@@ -1114,7 +1114,6 @@ name = "pam-zdr"
 version = "0.1.0"
 dependencies = [
  "pam-bindings",
- "rand",
  "zbus 4.1.1",
 ]
 
@@ -2157,6 +2156,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1afec51604565183aeb5c54c20aeab286120d4e4460f7f76e3e8bb8c0d99473"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "zdr-agent"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "zbus 4.1.1",
 ]
 
 [[package]]
