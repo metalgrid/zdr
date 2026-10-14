@@ -1,5 +1,6 @@
 mod align;
 mod args;
+mod camfind;
 mod capture;
 mod consent;
 mod engine;
