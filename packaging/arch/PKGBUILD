@@ -1,0 +1,58 @@
+# Maintainer: iso
+# Personal package: builds the committed master tree of the local zdr repo.
+# Commit your changes before rebuilding, or makepkg will not see them.
+pkgname=zdr
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Face-only Linux authentication with IR liveness and explicit consent (PAM + daemon + session agent)"
+arch=('x86_64')
+url="https://github.com/metalgrid/zdr"
+license=('MIT')
+depends=('pam' 'dbus' 'gcc-libs' 'glibc')
+makedepends=('cargo' 'rust' 'git')
+optdepends=('zenity: GUI consent popup for zdr-agent'
+            'v4l-utils: camera inspection'
+            'pamtester: test the PAM stack before enabling it')
+install=zdr.install
+source=("$pkgname::git+file:///path/to/zdr#branch=master"
+        "face_detection_yunet_2023mar.onnx::https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+        "face_recognition_sface_2021dec.onnx::https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx")
+sha256sums=('SKIP'
+            '8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4'
+            '0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79')
+
+build() {
+    cd "$srcdir/$pkgname"
+    # The ort crate downloads a prebuilt ONNX Runtime on first build,
+    # so this step needs network access.
+    cargo build --release --locked --workspace
+}
+
+check() {
+    cd "$srcdir/$pkgname"
+    cargo test --release --locked --workspace
+}
+
+package() {
+    cd "$srcdir/$pkgname"
+    install -Dm755 target/release/zdrd "$pkgdir/usr/bin/zdrd"
+    install -Dm755 target/release/zdr-agent "$pkgdir/usr/bin/zdr-agent"
+    install -Dm755 target/release/libpam_zdr.so "$pkgdir/usr/lib/security/pam_zdr.so"
+
+    install -Dm644 "$srcdir/face_detection_yunet_2023mar.onnx" \
+        "$pkgdir/usr/share/zdr/models/face_detection_yunet_2023mar.onnx"
+    install -Dm644 "$srcdir/face_recognition_sface_2021dec.onnx" \
+        "$pkgdir/usr/share/zdr/models/face_recognition_sface_2021dec.onnx"
+
+    install -Dm644 dbus-1/org.zdr.Authenticator.conf \
+        "$pkgdir/usr/share/dbus-1/system.d/org.zdr.Authenticator.conf"
+    install -Dm644 packaging/arch/org.zdr.Authenticator.service \
+        "$pkgdir/usr/share/dbus-1/system-services/org.zdr.Authenticator.service"
+    install -Dm644 packaging/arch/zdrd.service \
+        "$pkgdir/usr/lib/systemd/system/zdrd.service"
+    install -Dm644 packaging/arch/zdr-agent.desktop \
+        "$pkgdir/etc/xdg/autostart/zdr-agent.desktop"
+    install -Dm644 packaging/arch/zdr.tmpfiles \
+        "$pkgdir/usr/lib/tmpfiles.d/zdr.conf"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}
