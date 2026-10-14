@@ -304,6 +304,57 @@ pub fn evaluate_capture(
     (FeedbackKind::Stored, Some(emb.vector))
 }
 
+/// RGB-only quality gates (Step 14, `require_ir = false`): exactly
+/// one RGB face, RGB luma brightness in [20, 230], duplicate-pose
+/// rejection. On success returns (`stored`, Some(RGB embedding)).
+pub fn evaluate_capture_rgb(
+    engine: &mut dyn FaceEngine,
+    rgb: &RgbImage,
+    existing: &[Vec<f32>],
+) -> (FeedbackKind, Option<Vec<f32>>) {
+    let rgb_faces = match engine.detect(rgb) {
+        Ok(f) => f,
+        Err(_) => return (FeedbackKind::Error, None),
+    };
+    if rgb_faces.is_empty() {
+        return (FeedbackKind::NoFace, None);
+    }
+    if rgb_faces.len() > 1 {
+        return (FeedbackKind::MultipleFaces, None);
+    }
+    let brightness = mean_rgb_brightness(rgb);
+    if brightness < MIN_BRIGHTNESS {
+        return (FeedbackKind::TooDark, None);
+    }
+    if brightness > MAX_BRIGHTNESS {
+        return (FeedbackKind::TooBright, None);
+    }
+    let emb = match engine.embed_face(rgb, &rgb_faces[0]) {
+        Ok(e) => e,
+        Err(DaemonError::NoFace(_)) => return (FeedbackKind::NoFace, None),
+        Err(_) => return (FeedbackKind::Error, None),
+    };
+    if existing
+        .iter()
+        .any(|t| align::cosine(&emb.vector, t) >= DUPLICATE_COSINE)
+    {
+        return (FeedbackKind::DuplicatePose, None);
+    }
+    (FeedbackKind::Stored, Some(emb.vector))
+}
+
+/// Mean luma of an RGB frame (0..=255, Rec. 601 weights).
+pub fn mean_rgb_brightness(rgb: &RgbImage) -> f32 {
+    if rgb.is_empty() {
+        return 0.0;
+    }
+    let sum: f64 = rgb
+        .pixels()
+        .map(|p| 0.299 * p[0] as f64 + 0.587 * p[1] as f64 + 0.114 * p[2] as f64)
+        .sum();
+    (sum / (rgb.width() as f64 * rgb.height() as f64)) as f32
+}
+
 /// Mean pixel value of an IR frame (0..=255).
 pub fn mean_brightness(ir: &GrayImage) -> f32 {
     if ir.is_empty() {
@@ -464,6 +515,37 @@ mod tests {
     }
 
     #[test]
+    fn rgb_only_capture_gates() {
+        // Brightness comes from the RGB frame itself.
+        let bright_rgb = RgbImage::from_fn(4, 4, |_, _| image::Rgb([128, 128, 128]));
+        let dark_rgb = RgbImage::from_fn(4, 4, |_, _| image::Rgb([5, 5, 5]));
+        let mut eng = MockEngine::good(vec![1.0, 0.0]);
+        let (kind, emb) = evaluate_capture_rgb(&mut eng, &bright_rgb, &[]);
+        assert_eq!(kind, FeedbackKind::Stored);
+        assert_eq!(emb, Some(vec![1.0, 0.0]));
+        let mut eng = MockEngine::good(vec![1.0, 0.0]);
+        assert_eq!(
+            evaluate_capture_rgb(&mut eng, &dark_rgb, &[]).0,
+            FeedbackKind::TooDark
+        );
+        let mut eng = MockEngine::new(&[0], vec![vec![1.0, 0.0]]);
+        assert_eq!(
+            evaluate_capture_rgb(&mut eng, &bright_rgb, &[]).0,
+            FeedbackKind::NoFace
+        );
+        let mut eng = MockEngine::new(&[2], vec![vec![1.0, 0.0]]);
+        assert_eq!(
+            evaluate_capture_rgb(&mut eng, &bright_rgb, &[]).0,
+            FeedbackKind::MultipleFaces
+        );
+        let mut eng = MockEngine::good(vec![1.0, 0.0]);
+        assert_eq!(
+            evaluate_capture_rgb(&mut eng, &bright_rgb, &[vec![1.0, 0.0]]).0,
+            FeedbackKind::DuplicatePose
+        );
+    }
+
+    #[test]
     fn five_captures_ready_then_finish_snapshot() {
         let (mut e, now) = setup();
         assert_eq!(e.ready_snapshot("enr1", now), Err(EnrollError::NotReady));
@@ -526,7 +608,9 @@ mod tests {
         }
         let (user, embs) = e.ready_snapshot("enr1", now).expect("ready");
         let mut store = crate::templates::TemplateStore::new(dir.clone());
-        let stored = store.store(&user, &embs).expect("store");
+        let stored = store
+            .store(&user, &embs, crate::templates::TemplateMode::Ir)
+            .expect("store");
         assert_eq!(stored, NEEDED);
         assert!(e.cancel("enr1"), "session consumed after finish");
         // Reloaded from disk by a fresh store view of the same file.

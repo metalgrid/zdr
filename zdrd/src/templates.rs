@@ -1,10 +1,14 @@
-//! Template store v1 (Step 11): versioned binary embeddings, with the
-//! interim `ir*.png` files kept only as a one-time import path.
+//! Template store (Step 11, mode marker Step 14): versioned binary
+//! embeddings, with the interim `ir*.png` files kept only as a
+//! one-time import path.
 //!
 //! Layout: `<auth-dir>/<user>/templates.bin`
-//! Format: magic `"ZDRT"`, u16 version = 1, u32 count, then per template
-//! [`EMBEDDING_DIM`] little-endian f32 values. Writes are atomic (temp
-//! file in the same directory + rename) and the file is mode 0600.
+//! Format v1: magic `"ZDRT"`, u16 version = 1, u32 count, then per
+//! template [`EMBEDDING_DIM`] little-endian f32 values.
+//! Format v2: same, plus one mode byte after the version field
+//! (1 = IR templates, 2 = RGB templates). Writers always write v2;
+//! v1 files load as mode IR. Writes are atomic (temp file in the
+//! same directory + rename) and the file is mode 0600.
 //!
 //! Load rules: if `templates.bin` exists it is authoritative; a corrupt
 //! file (wrong magic/version/dimension, truncated, trailing bytes) is
@@ -23,12 +27,45 @@ use std::path::{Path, PathBuf};
 /// SFace embedding dimension. All stored/compared templates must match.
 pub const EMBEDDING_DIM: usize = 128;
 pub const TEMPLATE_MAGIC: &[u8; 4] = b"ZDRT";
-pub const TEMPLATE_VERSION: u16 = 1;
+pub const TEMPLATE_VERSION: u16 = 2;
+const TEMPLATE_VERSION_V1: u16 = 1;
 const HEADER_LEN: usize = 4 + 2 + 4;
+const HEADER_LEN_V2: usize = HEADER_LEN + 1;
+
+/// Which sensor a set of templates was enrolled with. Stored as the
+/// v2 mode byte; cross-mode matching is refused by `verify`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateMode {
+    Ir,
+    Rgb,
+}
+
+impl TemplateMode {
+    pub fn to_byte(self) -> u8 {
+        match self {
+            TemplateMode::Ir => 1,
+            TemplateMode::Rgb => 2,
+        }
+    }
+    pub fn from_byte(b: u8) -> Option<TemplateMode> {
+        match b {
+            1 => Some(TemplateMode::Ir),
+            2 => Some(TemplateMode::Rgb),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TemplateMode::Ir => "ir",
+            TemplateMode::Rgb => "rgb",
+        }
+    }
+}
 
 pub struct TemplateStore {
     auth_dir: PathBuf,
     cache: HashMap<String, Vec<Vec<f32>>>,
+    modes: HashMap<String, TemplateMode>,
 }
 
 pub fn valid_user(user: &str) -> bool {
@@ -39,8 +76,9 @@ pub fn templates_bin_path(auth_dir: &Path, user: &str) -> PathBuf {
     auth_dir.join(user).join("templates.bin")
 }
 
-/// Serialize embeddings. Every vector must be exactly EMBEDDING_DIM.
-pub fn encode_templates(templates: &[Vec<f32>]) -> Result<Vec<u8>> {
+/// Serialize embeddings as v2 with an explicit mode byte.
+/// Every vector must be exactly EMBEDDING_DIM.
+pub fn encode_templates_with_mode(templates: &[Vec<f32>], mode: TemplateMode) -> Result<Vec<u8>> {
     for t in templates {
         if t.len() != EMBEDDING_DIM {
             return Err(DaemonError::Invalid(format!(
@@ -51,9 +89,10 @@ pub fn encode_templates(templates: &[Vec<f32>]) -> Result<Vec<u8>> {
     }
     let count = u32::try_from(templates.len())
         .map_err(|_| DaemonError::Invalid("too many templates".into()))?;
-    let mut out = Vec::with_capacity(HEADER_LEN + templates.len() * EMBEDDING_DIM * 4);
+    let mut out = Vec::with_capacity(HEADER_LEN_V2 + templates.len() * EMBEDDING_DIM * 4);
     out.extend_from_slice(TEMPLATE_MAGIC);
     out.extend_from_slice(&TEMPLATE_VERSION.to_le_bytes());
+    out.push(mode.to_byte());
     out.extend_from_slice(&count.to_le_bytes());
     for t in templates {
         for v in t {
@@ -63,8 +102,15 @@ pub fn encode_templates(templates: &[Vec<f32>]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Serialize embeddings as IR-mode v2 (convenience wrapper, used by tests).
+#[allow(dead_code)]
+pub fn encode_templates(templates: &[Vec<f32>]) -> Result<Vec<u8>> {
+    encode_templates_with_mode(templates, TemplateMode::Ir)
+}
+
 /// Parse a `templates.bin` payload, rejecting any corruption.
-pub fn decode_templates(bytes: &[u8]) -> Result<Vec<Vec<f32>>> {
+/// Returns the stored mode (v1 files report IR) and the embeddings.
+pub fn decode_templates_with_mode(bytes: &[u8]) -> Result<(TemplateMode, Vec<Vec<f32>>)> {
     if bytes.len() < HEADER_LEN {
         return Err(DaemonError::Invalid(format!(
             "templates.bin too short: {} bytes, need at least {HEADER_LEN}",
@@ -77,13 +123,35 @@ pub fn decode_templates(bytes: &[u8]) -> Result<Vec<Vec<f32>>> {
         ));
     }
     let version = u16::from_le_bytes([bytes[4], bytes[5]]);
-    if version != TEMPLATE_VERSION {
-        return Err(DaemonError::Invalid(format!(
-            "templates.bin unsupported version {version} (expected {TEMPLATE_VERSION})"
-        )));
-    }
-    let count = u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]) as usize;
-    let expected = HEADER_LEN
+    let (mode, header_len, count) = match version {
+        TEMPLATE_VERSION_V1 => (
+            TemplateMode::Ir,
+            HEADER_LEN,
+            u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]) as usize,
+        ),
+        TEMPLATE_VERSION => {
+            if bytes.len() < HEADER_LEN_V2 {
+                return Err(DaemonError::Invalid(format!(
+                    "templates.bin v2 too short: {} bytes, need at least {HEADER_LEN_V2}",
+                    bytes.len()
+                )));
+            }
+            let mode = TemplateMode::from_byte(bytes[6]).ok_or_else(|| {
+                DaemonError::Invalid(format!("templates.bin unknown mode byte {}", bytes[6]))
+            })?;
+            (
+                mode,
+                HEADER_LEN_V2,
+                u32::from_le_bytes([bytes[7], bytes[8], bytes[9], bytes[10]]) as usize,
+            )
+        }
+        other => {
+            return Err(DaemonError::Invalid(format!(
+                "templates.bin unsupported version {other} (expected {TEMPLATE_VERSION_V1} or {TEMPLATE_VERSION})"
+            )))
+        }
+    };
+    let expected = header_len
         .checked_add(
             count
                 .checked_mul(EMBEDDING_DIM * 4)
@@ -98,7 +166,7 @@ pub fn decode_templates(bytes: &[u8]) -> Result<Vec<Vec<f32>>> {
         )));
     }
     let mut out = Vec::with_capacity(count);
-    let mut off = HEADER_LEN;
+    let mut off = header_len;
     for _ in 0..count {
         let mut v = Vec::with_capacity(EMBEDDING_DIM);
         for _ in 0..EMBEDDING_DIM {
@@ -112,12 +180,23 @@ pub fn decode_templates(bytes: &[u8]) -> Result<Vec<Vec<f32>>> {
         }
         out.push(v);
     }
-    Ok(out)
+    Ok((mode, out))
 }
 
+/// Parse a `templates.bin` payload, discarding the mode.
+#[allow(dead_code)]
+pub fn decode_templates(bytes: &[u8]) -> Result<Vec<Vec<f32>>> {
+    Ok(decode_templates_with_mode(bytes)?.1)
+}
+
+#[allow(dead_code)]
 pub fn load_templates_file(path: &Path) -> Result<Vec<Vec<f32>>> {
+    Ok(load_templates_file_with_mode(path)?.1)
+}
+
+pub fn load_templates_file_with_mode(path: &Path) -> Result<(TemplateMode, Vec<Vec<f32>>)> {
     let bytes = std::fs::read(path).map_err(|e| crate::error::io_at(path, e))?;
-    decode_templates(&bytes)
+    decode_templates_with_mode(&bytes)
 }
 
 /// Atomically write `templates.bin` for `user` (temp file + rename),
@@ -126,6 +205,7 @@ pub fn write_templates_file(
     auth_dir: &Path,
     user: &str,
     templates: &[Vec<f32>],
+    mode: TemplateMode,
 ) -> Result<PathBuf> {
     if !valid_user(user) {
         return Err(DaemonError::Invalid(format!("invalid user name {user:?}")));
@@ -137,7 +217,7 @@ pub fn write_templates_file(
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     }
-    let bytes = encode_templates(templates)?;
+    let bytes = encode_templates_with_mode(templates, mode)?;
     let final_path = dir.join("templates.bin");
     // Temp file in the same directory so rename stays on one filesystem.
     let tmp_path = dir.join(format!(".templates.bin.tmp-{}", std::process::id()));
@@ -226,6 +306,7 @@ impl TemplateStore {
         TemplateStore {
             auth_dir,
             cache: HashMap::new(),
+            modes: HashMap::new(),
         }
     }
 
@@ -260,11 +341,15 @@ impl TemplateStore {
         }
         let bin = templates_bin_path(&self.auth_dir, user);
         if bin.is_file() {
-            return match load_templates_file(&bin) {
-                Ok(embs) => {
+            return match load_templates_file_with_mode(&bin) {
+                Ok((mode, embs)) => {
                     let count = embs.len();
-                    eprintln!("zdrd: templates user={user} count={count} (templates.bin)");
+                    eprintln!(
+                        "zdrd: templates user={user} count={count} mode={} (templates.bin)",
+                        mode.as_str()
+                    );
                     self.cache.insert(user.to_string(), embs);
+                    self.modes.insert(user.to_string(), mode);
                     count
                 }
                 Err(e) => {
@@ -273,6 +358,7 @@ impl TemplateStore {
                         bin.display()
                     );
                     self.cache.insert(user.to_string(), Vec::new());
+                    self.modes.remove(user);
                     0
                 }
             };
@@ -280,7 +366,7 @@ impl TemplateStore {
         if !template_files(&self.auth_dir, user).is_empty() {
             let embs = embed_templates(engine, &self.auth_dir, user);
             if !embs.is_empty() {
-                match write_templates_file(&self.auth_dir, user, &embs) {
+                match write_templates_file(&self.auth_dir, user, &embs, TemplateMode::Ir) {
                     Ok(p) => eprintln!(
                         "zdrd: templates user={user}: imported {} PNG template(s) -> {}",
                         embs.len(),
@@ -294,21 +380,42 @@ impl TemplateStore {
             let count = embs.len();
             eprintln!("zdrd: templates user={user} count={count} (imported ir*.png)");
             self.cache.insert(user.to_string(), embs);
+            if count > 0 {
+                self.modes.insert(user.to_string(), TemplateMode::Ir);
+            } else {
+                self.modes.remove(user);
+            }
             return count;
         }
         self.cache.insert(user.to_string(), Vec::new());
+        self.modes.remove(user);
         0
     }
 
     /// Persist `templates` for `user` to templates.bin and reload the
     /// in-memory cache from what was written. Returns stored count.
-    pub fn store(&mut self, user: &str, templates: &[Vec<f32>]) -> Result<usize> {
-        write_templates_file(&self.auth_dir, user, templates)?;
+    pub fn store(
+        &mut self,
+        user: &str,
+        templates: &[Vec<f32>],
+        mode: TemplateMode,
+    ) -> Result<usize> {
+        write_templates_file(&self.auth_dir, user, templates, mode)?;
         // Reload from disk so the cache provably matches the file.
-        let embs = load_templates_file(&templates_bin_path(&self.auth_dir, user))?;
+        let (stored_mode, embs) =
+            load_templates_file_with_mode(&templates_bin_path(&self.auth_dir, user))?;
         let count = embs.len();
         self.cache.insert(user.to_string(), embs);
+        self.modes.insert(user.to_string(), stored_mode);
         Ok(count)
+    }
+
+    /// Mode of the user's stored templates, if any are loaded.
+    pub fn mode(&self, user: &str) -> Option<TemplateMode> {
+        if self.get(user).is_empty() {
+            return None;
+        }
+        self.modes.get(user).copied()
     }
 
     pub fn get(&self, user: &str) -> &[Vec<f32>] {
@@ -339,7 +446,8 @@ mod tests {
     fn store_round_trip() {
         let dir = temp_dir("roundtrip");
         let templates = vec![emb(0.5), emb(-0.25)];
-        let path = write_templates_file(&dir, "alice", &templates).expect("write");
+        let path =
+            write_templates_file(&dir, "alice", &templates, TemplateMode::Ir).expect("write");
         assert_eq!(load_templates_file(&path).expect("load"), templates);
         #[cfg(unix)]
         {
@@ -348,6 +456,35 @@ mod tests {
             assert_eq!(mode, 0o600, "templates.bin must be 0600");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v1_loads_as_ir_and_v2_round_trips_mode() {
+        // Hand-build a v1 payload: magic, u16 1, u32 count, f32s.
+        let templates = vec![emb(0.5)];
+        let mut v1 = Vec::new();
+        v1.extend_from_slice(TEMPLATE_MAGIC);
+        v1.extend_from_slice(&1u16.to_le_bytes());
+        v1.extend_from_slice(&1u32.to_le_bytes());
+        for v in &templates[0] {
+            v1.extend_from_slice(&v.to_le_bytes());
+        }
+        let (mode, loaded) = decode_templates_with_mode(&v1).expect("v1 decode");
+        assert_eq!(mode, TemplateMode::Ir);
+        assert_eq!(loaded, templates);
+
+        for want in [TemplateMode::Ir, TemplateMode::Rgb] {
+            let bytes = encode_templates_with_mode(&templates, want).expect("v2 encode");
+            assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), TEMPLATE_VERSION);
+            assert_eq!(bytes[6], want.to_byte());
+            let (mode, loaded) = decode_templates_with_mode(&bytes).expect("v2 decode");
+            assert_eq!(mode, want);
+            assert_eq!(loaded, templates);
+        }
+        // Unknown mode byte is corruption.
+        let mut bad = encode_templates(&templates).expect("encode");
+        bad[6] = 7;
+        assert!(decode_templates_with_mode(&bad).is_err());
     }
 
     #[test]

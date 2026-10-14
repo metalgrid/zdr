@@ -1,36 +1,43 @@
 use clap::Parser;
 use std::path::PathBuf;
 
+/// Daemon CLI. Every setting is optional on the command line:
+/// precedence is CLI flag > `/etc/zdr/zdrd.toml` > built-in default
+/// (see `config.rs`). No camera path is hard-coded any more; cameras
+/// default to auto-detection.
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 pub struct Args {
+    /// Path to the daemon config file.
+    #[arg(long, default_value = crate::config::DEFAULT_CONFIG_PATH)]
+    pub config: PathBuf,
+
     /// Path to the YuNet face-detection ONNX model.
     #[arg(long)]
-    pub yunet: PathBuf,
+    pub yunet: Option<PathBuf>,
 
     /// Path to the SFace face-recognition ONNX model.
     #[arg(long)]
-    pub sface: PathBuf,
+    pub sface: Option<PathBuf>,
 
-    /// RGB camera device.
-    #[arg(
-        long,
-        default_value = "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:6:1.0-video-index0"
-    )]
-    pub rgb_camera: String,
+    /// RGB camera device, or `auto` to auto-detect.
+    #[arg(long)]
+    pub rgb_camera: Option<String>,
 
-    /// IR camera device.
-    #[arg(
-        long,
-        default_value = "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:6:1.2-video-index0"
-    )]
-    pub ir_camera: String,
+    /// IR camera device, or `auto` to auto-detect.
+    #[arg(long)]
+    pub ir_camera: Option<String>,
 
-    /// Directory holding per-user interim templates: <auth-dir>/<user>/ir*.png
-    #[arg(long, default_value = "/var/lib/zdr")]
-    pub auth_dir: PathBuf,
+    /// Directory holding per-user templates: <auth-dir>/<user>/templates.bin
+    #[arg(long)]
+    pub auth_dir: Option<PathBuf>,
 
-    /// Cosine-similarity match threshold for IR templates.
-    #[arg(long, default_value_t = 0.363)]
-    pub threshold: f32,
+    /// Cosine-similarity match threshold.
+    #[arg(long)]
+    pub threshold: Option<f32>,
+
+    /// Require the IR camera (default true). `--require-ir=false`
+    /// selects insecure RGB-only mode; see the README warning.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", value_parser = clap::value_parser!(bool))]
+    pub require_ir: Option<bool>,
 }

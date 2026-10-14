@@ -13,6 +13,8 @@
 //! - `BeginEnroll(user) -> (enroll_id)`, `EnrollCapture(enroll_id) ->
 //!   (state, captured, needed, kind)`, `FinishEnroll(enroll_id) ->
 //!   (stored)`, `CancelEnroll(enroll_id) -> ()` — root only (Step 11)
+//! - `ServerInfo() -> (version, require_ir)` — read-only, any uid,
+//!   no side effects (Step 14; the only contract addition)
 //! - Signal `AuthRequested(request_id, user, service, tty, label)`
 //! - Signal `AuthFeedback(request_id, kind, message)` — emitted during
 //!   CaptureVerify and enrollment captures; for enrollment the first
@@ -72,6 +74,12 @@ impl From<ConsentError> for AuthError {
 /// string, never a panic.
 pub trait Verifier: Send + Sync {
     fn verify(&self, user: &str) -> (bool, String);
+
+    /// Whether this verifier requires the IR camera. `false` means
+    /// RGB-only mode. Reported read-only via `ServerInfo`.
+    fn require_ir(&self) -> bool {
+        true
+    }
 
     /// Verify with streamed feedback: `capturing` before capture, then
     /// exactly one terminal kind matching the `(matched, reason)` result.
@@ -208,6 +216,16 @@ async fn emit_feedback(emitter: &SignalEmitter<'_>, request_id: &str, kind: Feed
 
 #[interface(name = "org.zdr.Authenticator")]
 impl Authenticator {
+    /// Read-only daemon info: callable by any uid, no side effects,
+    /// no authorization check by design (Step 14 contract addition).
+    #[zbus(out_args("version", "require_ir"))]
+    async fn server_info(&self) -> (String, bool) {
+        (
+            env!("CARGO_PKG_VERSION").to_string(),
+            self.verifier.require_ir(),
+        )
+    }
+
     async fn register_agent(
         &self,
         #[zbus(header)] header: Header<'_>,
