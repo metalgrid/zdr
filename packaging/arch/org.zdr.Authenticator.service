@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.zdr.Authenticator
+Exec=/usr/bin/zdrd --yunet /usr/share/zdr/models/face_detection_yunet_2023mar.onnx --sface /usr/share/zdr/models/face_recognition_sface_2021dec.onnx --auth-dir /var/lib/zdr
+SystemdService=zdrd.service

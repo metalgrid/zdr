@@ -1,0 +1,18 @@
+[Unit]
+Description=zdr face authentication daemon
+After=dbus.service
+
+[Service]
+Type=dbus
+BusName=org.zdr.Authenticator
+ExecStart=/usr/bin/zdrd --yunet /usr/share/zdr/models/face_detection_yunet_2023mar.onnx --sface /usr/share/zdr/models/face_recognition_sface_2021dec.onnx --auth-dir /var/lib/zdr
+StateDirectory=zdr
+StateDirectoryMode=0700
+Restart=on-failure
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/zdr
+
+[Install]
+WantedBy=multi-user.target

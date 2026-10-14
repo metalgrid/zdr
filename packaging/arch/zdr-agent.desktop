@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=zdr face authentication agent
+Comment=Shows face authentication consent prompts for your session
+Exec=/usr/bin/zdr-agent
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

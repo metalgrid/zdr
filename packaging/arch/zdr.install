@@ -1,0 +1,19 @@
+post_install() {
+    echo ">>> zdr installed. Next steps:"
+    echo ">>> 1. Start the daemon:  systemctl enable --now zdrd.service"
+    echo ">>> 2. Enroll IR templates for your user:"
+    echo ">>>      install -d -m700 /var/lib/zdr/\$USER"
+    echo ">>>      Copy 3-5 IR captures named ir*.png into that directory."
+    echo ">>>    Tip: spike/ in the source repo captures them (zdr-spike capture)."
+    echo ">>> 3. Log out and back in so zdr-agent starts in your session"
+    echo ">>>    (or run zdr-agent once by hand)."
+    echo ">>> 4. Test with pamtester BEFORE touching a real service."
+    echo ">>> 5. Only then add as the FIRST line of /etc/pam.d/sudo:"
+    echo ">>>      auth sufficient pam_zdr.so"
+    echo ">>>    Keep a root shell open while you test. Face failure must"
+    echo ">>>    fall through to the password prompt."
+}
+
+post_upgrade() {
+    echo ">>> zdr upgraded. Restart the daemon: systemctl restart zdrd.service"
+}
