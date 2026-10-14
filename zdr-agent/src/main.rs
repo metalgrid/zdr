@@ -424,6 +424,24 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Shutdown watcher: the session loop blocks inside the zbus signal
+    // iterator, where no code polls SHUTDOWN and the EINTR from the
+    // signal is swallowed by the async-io reactor. Without this thread
+    // Ctrl-C sets the flag and the process hangs until SIGQUIT.
+    // Exiting directly is safe: any in-flight request expires at the
+    // daemon within its 30 s TTL, and a restarted agent replaces the
+    // stale registration when it registers again.
+    std::thread::Builder::new()
+        .name("zdr-agent-shutdown".to_string())
+        .spawn(|| loop {
+            if shutdown_requested() {
+                eprintln!("zdr-agent: exiting cleanly (signal)");
+                std::process::exit(0);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        })
+        .expect("spawning the shutdown watcher cannot fail");
+
     // Our identity comes from getuid/getpwuid, never from $USER:
     // the request filter is only meaningful against the passwd
     // entry for the uid this process actually runs as.
