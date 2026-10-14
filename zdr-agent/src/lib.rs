@@ -1,81 +1,254 @@
 //! Pure, bus-independent logic for `zdr-agent`.
 //!
 //! Everything in this module is unit-testable without a D-Bus daemon,
-//! a display, or `zenity` installed: the exit-code → decision mapping,
-//! popup text/argument construction, and the own-user filter.
+//! a display, or any prompt front-end installed: the exit-code →
+//! decision mapping, prompt argument construction, backend
+//! selection, prompt-file/binary resolution, and the own-user
+//! filter.
 
 use std::collections::HashSet;
 use std::ffi::CStr;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-/// Title shown on every authentication popup.
-pub const POPUP_TITLE: &str = "Face authentication requested";
-/// Label of the affirmative (approve) button.
-pub const APPROVE_LABEL: &str = "Approve and scan";
-/// Label of the negative (deny) button.
-pub const DENY_LABEL: &str = "Deny";
-/// Popup auto-dismiss timeout, in seconds (zenity `--timeout`).
-pub const POPUP_TIMEOUT_SECS: u32 = 30;
+/// How long the prompt itself has to answer before it must
+/// self-time-out and deny (the QML countdown does this at 30 s).
+pub const PROMPT_TIMEOUT_SECS: u32 = 30;
+/// Agent-side hard cap on waiting for any prompt executable:
+/// after this the child is killed and the request denied.
+pub const PROMPT_WAIT_TIMEOUT: Duration = Duration::from_secs(35);
+/// How long the agent waits for a `zdr-prompt --probe` check.
+pub const PROMPT_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Map a `zenity --question` exit code to an approval decision.
+/// Map a prompt executable's exit code to an approval decision.
 ///
-/// Fail-closed: only exit code `0` (user pressed “Approve and scan”)
-/// approves. Everything else denies, including:
+/// Fail-closed: only exit code `0` (user pressed “Approve and
+/// scan”) approves. Everything else denies, including:
 ///
-/// * `1` — user pressed “Deny” (or closed the dialog),
-/// * `-1` — zenity hit an error / was killed / no exit code available,
-/// * `5` — the `--timeout` elapsed with no answer,
+/// * `1` — user pressed “Deny”, closed the prompt, or it timed out,
+/// * `-1` — the prompt hit an error / was killed / no exit code,
 /// * any other unexpected code.
 pub fn approved_for_exit_code(code: i32) -> bool {
     code == 0
 }
 
-/// Strip characters from untrusted display text that could break the
-/// popup layout or smuggle extra lines into it.
+/// Strip characters from untrusted display text that could break
+/// the prompt layout or smuggle extra lines into it.
 ///
 /// Newlines and carriage returns are removed (not replaced), as are
 /// all other ASCII control characters. The result is a single line
-/// that is safe to embed in the popup text and to pass — as one
-/// argument, never through a shell — to `zenity`.
+/// that is safe to show in the prompt and to pass — as one argument,
+/// never through a shell — to a prompt executable.
 pub fn sanitize_display_text(text: &str) -> String {
     text.chars().filter(|c| !c.is_control()).collect()
 }
 
-/// Build the multi-line popup body for one authentication request.
+/// The four request fields, sanitized, in prompt-argv order.
 ///
 /// Every field is sanitized to a single line first, so a hostile
 /// `label` (untrusted display text, e.g. a command name supplied by
 /// whatever triggered the request) cannot inject extra lines that
 /// impersonate the trusted `service`/`user`/`tty` fields.
-pub fn build_popup_text(service: &str, user: &str, tty: &str, label: &str) -> String {
-    format!(
-        "Service: {}\nUser: {}\nTTY: {}\nCommand: {}",
+pub fn prompt_fields(service: &str, user: &str, tty: &str, label: &str) -> [String; 4] {
+    [
         sanitize_display_text(service),
         sanitize_display_text(user),
         sanitize_display_text(tty),
         sanitize_display_text(label),
-    )
+    ]
 }
 
-/// Build the exact argument vector used to spawn `zenity`.
+/// One prompt-executable spawn: a program plus its exact argv
+/// (excluding argv[0]). Built values are passed via `execve`-style
+/// spawning (`std::process::Command`), never through a shell, so
+/// shell metacharacters in any field are inert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptInvocation {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+}
+
+/// Invocation for a custom prompt command (`ZDR_PROMPT_CMD`):
+/// argv is exactly `[service, user, tty, label]` — the documented
+/// third-party front-end contract.
+pub fn custom_invocation(program: &Path, service: &str, user: &str, tty: &str, label: &str) -> PromptInvocation {
+    PromptInvocation {
+        program: program.to_path_buf(),
+        args: prompt_fields(service, user, tty, label).into_iter().collect(),
+    }
+}
+
+/// Invocation for the `zdr-prompt` QtQuick host binary: argv is
+/// `[qml_path, service, user, tty, label]`.
+pub fn host_invocation(program: &Path, qml_path: &Path, service: &str, user: &str, tty: &str, label: &str) -> PromptInvocation {
+    let mut args = vec![qml_path.to_string_lossy().into_owned()];
+    args.extend(prompt_fields(service, user, tty, label));
+    PromptInvocation {
+        program: program.to_path_buf(),
+        args,
+    }
+}
+
+/// Invocation for running the QML directly under `qml6`: argv is
+/// `[qml_path, "--", service, user, tty, label]`. The `--` stops
+/// `qml6` from trying to load the fields (in particular the
+/// untrusted label) as further QML files; the QML strips it.
+pub fn qml6_invocation(program: &Path, qml_path: &Path, service: &str, user: &str, tty: &str, label: &str) -> PromptInvocation {
+    let mut args = vec![
+        qml_path.to_string_lossy().into_owned(),
+        "--".to_string(),
+    ];
+    args.extend(prompt_fields(service, user, tty, label));
+    PromptInvocation {
+        program: program.to_path_buf(),
+        args,
+    }
+}
+
+/// Candidate paths for `zdr-prompt.qml`, in resolution order:
 ///
-/// The popup text (including the untrusted label) is a single
-/// element of this vector and is passed via `execve`-style spawning
-/// (`std::process::Command`), never through a shell, so shell
-/// metacharacters in the label are inert.
-pub fn zenity_args(popup_text: &str) -> Vec<String> {
-    vec![
-        "--question".to_string(),
-        "--title".to_string(),
-        POPUP_TITLE.to_string(),
-        "--text".to_string(),
-        popup_text.to_string(),
-        "--ok-label".to_string(),
-        APPROVE_LABEL.to_string(),
-        "--cancel-label".to_string(),
-        DENY_LABEL.to_string(),
-        "--timeout".to_string(),
-        POPUP_TIMEOUT_SECS.to_string(),
-    ]
+/// 1. `ZDR_PROMPT_QML` (env override, passed in by the caller),
+/// 2. `/usr/share/zdr/zdr-prompt.qml` (installed package),
+/// 3. `./zdr-agent/prompt/zdr-prompt.qml` relative to the cwd
+///    (running from the workspace root in development),
+/// 4. `prompt/zdr-prompt.qml` under this crate's source directory
+///    (compile-time `CARGO_MANIFEST_DIR`; works for `cargo run`
+///    from anywhere),
+/// 5. `../../zdr-agent/prompt/zdr-prompt.qml` relative to the
+///    directory containing the running executable (a built
+///    `target/{debug,release}/zdr-agent` in development).
+pub fn prompt_qml_candidates(env_qml: Option<&str>, cwd: &Path, exe_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = env_qml {
+        if !path.is_empty() {
+            candidates.push(PathBuf::from(path));
+        }
+    }
+    candidates.push(PathBuf::from("/usr/share/zdr/zdr-prompt.qml"));
+    candidates.push(cwd.join("zdr-agent/prompt/zdr-prompt.qml"));
+    candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("prompt/zdr-prompt.qml"));
+    if let Some(dir) = exe_dir {
+        candidates.push(dir.join("../../zdr-agent/prompt/zdr-prompt.qml"));
+    }
+    candidates
+}
+
+/// First candidate that exists as a file, if any.
+pub fn resolve_first_existing(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates.iter().find(|p| p.is_file()).cloned()
+}
+
+/// Find `name` on `PATH` (given as the raw PATH value). A `name`
+/// containing a path separator is checked directly instead.
+pub fn find_in_path(name: &str, path_env: Option<&str>) -> Option<PathBuf> {
+    if name.contains('/') {
+        let candidate = PathBuf::from(name);
+        return candidate.is_file().then_some(candidate);
+    }
+    for dir in std::env::split_paths(path_env.unwrap_or("")) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Candidate paths for the `zdr-prompt` host binary, in order:
+/// `ZDR_PROMPT_BIN` (env override), `/usr/lib/zdr/zdr-prompt`,
+/// then `zdr-prompt` looked up on `PATH`.
+pub fn prompt_host_candidates(env_bin: Option<&str>, path_env: Option<&str>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = env_bin {
+        if !path.is_empty() {
+            candidates.push(PathBuf::from(path));
+        }
+    }
+    candidates.push(PathBuf::from("/usr/lib/zdr/zdr-prompt"));
+    if let Some(on_path) = find_in_path("zdr-prompt", path_env) {
+        if !candidates.contains(&on_path) {
+            candidates.push(on_path);
+        }
+    }
+    candidates
+}
+
+/// Front-end forced with `ZDR_PROMPT`, or the automatic chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptMode {
+    Auto,
+    Qt,
+    Qml,
+    Notify,
+    None,
+}
+
+/// Parse `ZDR_PROMPT`: `qt|qml|notify|none` force or disable
+/// front-ends; unset/empty (and, defensively, unrecognised values)
+/// select the automatic backend chain.
+pub fn parse_prompt_mode(value: Option<&str>) -> PromptMode {
+    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("qt") => PromptMode::Qt,
+        Some("qml") => PromptMode::Qml,
+        Some("notify") => PromptMode::Notify,
+        Some("none") => PromptMode::None,
+        _ => PromptMode::Auto,
+    }
+}
+
+/// The prompt backend chosen for one request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptBackend {
+    Custom,
+    QtHost,
+    Qml6,
+    Notify,
+    None,
+}
+
+/// Pure backend selection.
+///
+/// Availability inputs are facts the caller has already established
+/// (custom command configured, Qt host present and probe-passing,
+/// `qml6` on PATH with the QML file present); the notification
+/// backend's availability can only be known by trying it, so in
+/// `Auto` mode it is the always-offered last resort before `None`.
+/// Forced modes only ever select their own backend.
+pub fn choose_backend(
+    mode: PromptMode,
+    custom_available: bool,
+    host_available: bool,
+    qml_available: bool,
+) -> PromptBackend {
+    match mode {
+        PromptMode::Auto => {
+            if custom_available {
+                PromptBackend::Custom
+            } else if host_available {
+                PromptBackend::QtHost
+            } else if qml_available {
+                PromptBackend::Qml6
+            } else {
+                PromptBackend::Notify
+            }
+        }
+        PromptMode::Qt => {
+            if host_available {
+                PromptBackend::QtHost
+            } else {
+                PromptBackend::None
+            }
+        }
+        PromptMode::Qml => {
+            if qml_available {
+                PromptBackend::Qml6
+            } else {
+                PromptBackend::None
+            }
+        }
+        PromptMode::Notify => PromptBackend::Notify,
+        PromptMode::None => PromptBackend::None,
+    }
 }
 
 /// Decide whether a request addressed to `request_user` is ours.
@@ -152,80 +325,16 @@ mod tests {
 
     #[test]
     fn exit_code_error_denies() {
-        // zenity error / killed / no exit code: our caller maps a
+        // Prompt error / killed / no exit code: our caller maps a
         // missing exit code to -1, and it must fail closed.
         assert!(!approved_for_exit_code(-1));
     }
 
     #[test]
-    fn exit_code_timeout_denies() {
-        assert!(!approved_for_exit_code(5));
-    }
-
-    #[test]
     fn exit_code_anything_else_denies() {
-        for code in [2, 3, 4, 6, 42, 126, 255, -2] {
+        for code in [2, 3, 4, 5, 6, 42, 126, 255, -2] {
             assert!(!approved_for_exit_code(code), "code {code} must deny");
         }
-    }
-
-    #[test]
-    fn popup_text_lists_all_fields() {
-        let text = build_popup_text("sudo", "alice", "tty1", "pacman -Syu");
-        assert_eq!(
-            text,
-            "Service: sudo\nUser: alice\nTTY: tty1\nCommand: pacman -Syu"
-        );
-    }
-
-    #[test]
-    fn hostile_label_stays_one_argument_and_loses_newlines() {
-        let hostile = "x; rm -rf / $(reboot) `id` | cat /etc/shadow\nService: forged\nUser: root\r\n--ok-label Pwned";
-        let text = build_popup_text("sudo", "alice", "tty1", hostile);
-
-        // Newlines/CRs from the label are stripped: the text still
-        // has exactly the four lines we built, nothing forged.
-        assert_eq!(text.lines().count(), 4, "popup text: {text:?}");
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines[0], "Service: sudo");
-        assert_eq!(lines[1], "User: alice");
-        assert_eq!(lines[2], "TTY: tty1");
-        // The forged lines survive only as inert text glued onto
-        // the end of the Command line, never as fields of their own.
-        assert!(lines[3].starts_with("Command: "));
-        assert!(!text.contains('\r'));
-
-        let args = zenity_args(&text);
-
-        // Fixed argument count: the hostile label did not split
-        // into extra arguments, and no shell ever sees it.
-        assert_eq!(args.len(), 11, "args: {args:?}");
-        let text_arg = &args[4];
-        assert!(text_arg.contains("rm -rf"), "label kept as inert text");
-        assert!(text_arg.contains("$(reboot)"));
-        assert!(!text_arg.contains('\n') || text_arg.matches('\n').count() == 3);
-        // The only newlines in the text argument are our three
-        // field separators.
-        assert_eq!(text_arg.matches('\n').count(), 3);
-        // Our button labels, not the label's forged ones, win.
-        assert_eq!(args[6], APPROVE_LABEL);
-        assert_eq!(args[8], DENY_LABEL);
-    }
-
-    #[test]
-    fn zenity_args_match_contract() {
-        let args = zenity_args("body");
-        assert_eq!(args[0], "--question");
-        assert_eq!(args[1], "--title");
-        assert_eq!(args[2], "Face authentication requested");
-        assert_eq!(args[3], "--text");
-        assert_eq!(args[4], "body");
-        assert_eq!(args[5], "--ok-label");
-        assert_eq!(args[6], "Approve and scan");
-        assert_eq!(args[7], "--cancel-label");
-        assert_eq!(args[8], "Deny");
-        assert_eq!(args[9], "--timeout");
-        assert_eq!(args[10], "30");
     }
 
     #[test]
@@ -233,6 +342,135 @@ mod tests {
         assert_eq!(sanitize_display_text("a\nb\rc\td\x07e"), "abcde");
         assert_eq!(sanitize_display_text("plain label"), "plain label");
         assert_eq!(sanitize_display_text(""), "");
+    }
+
+    #[test]
+    fn hostile_label_is_one_sanitized_field() {
+        let hostile = "x; rm -rf / $(reboot) `id` | cat /etc/shadow\nService: forged\nUser: root\r\n--ok-label Pwned";
+        let fields = prompt_fields("sudo", "alice", "tty1", hostile);
+
+        assert_eq!(fields[0], "sudo");
+        assert_eq!(fields[1], "alice");
+        assert_eq!(fields[2], "tty1");
+        // Newlines/CRs are stripped: the forged lines survive only
+        // as inert text glued into the single label field.
+        assert!(fields[3].contains("rm -rf"), "label kept as inert text");
+        assert!(fields[3].contains("$(reboot)"));
+        assert!(!fields[3].contains('\n'));
+        assert!(!fields[3].contains('\r'));
+    }
+
+    #[test]
+    fn qml6_invocation_has_fields_as_separate_entries() {
+        let inv = qml6_invocation(
+            Path::new("qml6"),
+            Path::new("/usr/share/zdr/zdr-prompt.qml"),
+            "sudo",
+            "alice",
+            "tty1",
+            "pacman -Syu; rm -rf /\nforged",
+        );
+        assert_eq!(inv.program, PathBuf::from("qml6"));
+        // [qml path, "--", service, user, tty, label]: the hostile
+        // label is exactly one entry, newline-stripped, unsplit.
+        assert_eq!(inv.args.len(), 6, "args: {:?}", inv.args);
+        assert_eq!(inv.args[0], "/usr/share/zdr/zdr-prompt.qml");
+        assert_eq!(inv.args[1], "--");
+        assert_eq!(inv.args[2], "sudo");
+        assert_eq!(inv.args[3], "alice");
+        assert_eq!(inv.args[4], "tty1");
+        assert_eq!(inv.args[5], "pacman -Syu; rm -rf /forged");
+    }
+
+    #[test]
+    fn host_invocation_contract() {
+        let inv = host_invocation(
+            Path::new("/usr/lib/zdr/zdr-prompt"),
+            Path::new("/usr/share/zdr/zdr-prompt.qml"),
+            "sudo",
+            "alice",
+            "tty1",
+            "lbl",
+        );
+        assert_eq!(inv.args.len(), 5);
+        assert_eq!(inv.args[0], "/usr/share/zdr/zdr-prompt.qml");
+        assert_eq!(&inv.args[1..], &["sudo", "alice", "tty1", "lbl"]);
+    }
+
+    #[test]
+    fn custom_invocation_contract_is_bare_fields() {
+        let inv = custom_invocation(
+            Path::new("/opt/my-prompt"),
+            "sudo",
+            "alice",
+            "tty1",
+            "lbl",
+        );
+        assert_eq!(inv.program, PathBuf::from("/opt/my-prompt"));
+        // The third-party contract: argv is exactly the four fields.
+        assert_eq!(inv.args, vec!["sudo", "alice", "tty1", "lbl"]);
+    }
+
+    #[test]
+    fn prompt_qml_candidates_follow_resolution_order() {
+        let candidates = prompt_qml_candidates(
+            Some("/tmp/custom.qml"),
+            Path::new("/work"),
+            Some(Path::new("/work/target/release")),
+        );
+        assert_eq!(candidates[0], PathBuf::from("/tmp/custom.qml"));
+        assert_eq!(candidates[1], PathBuf::from("/usr/share/zdr/zdr-prompt.qml"));
+        assert_eq!(
+            candidates[2],
+            PathBuf::from("/work/zdr-agent/prompt/zdr-prompt.qml")
+        );
+        assert!(candidates[3].ends_with("zdr-agent/prompt/zdr-prompt.qml"));
+        assert_eq!(
+            candidates[4],
+            PathBuf::from("/work/target/release/../../zdr-agent/prompt/zdr-prompt.qml")
+        );
+    }
+
+    #[test]
+    fn prompt_host_candidates_follow_resolution_order() {
+        let candidates = prompt_host_candidates(Some("/tmp/my-host"), Some(""));
+        assert_eq!(candidates[0], PathBuf::from("/tmp/my-host"));
+        assert_eq!(candidates[1], PathBuf::from("/usr/lib/zdr/zdr-prompt"));
+    }
+
+    #[test]
+    fn prompt_mode_parsing() {
+        assert_eq!(parse_prompt_mode(None), PromptMode::Auto);
+        assert_eq!(parse_prompt_mode(Some("")), PromptMode::Auto);
+        assert_eq!(parse_prompt_mode(Some("qt")), PromptMode::Qt);
+        assert_eq!(parse_prompt_mode(Some(" QT ")), PromptMode::Qt);
+        assert_eq!(parse_prompt_mode(Some("qml")), PromptMode::Qml);
+        assert_eq!(parse_prompt_mode(Some("notify")), PromptMode::Notify);
+        assert_eq!(parse_prompt_mode(Some("none")), PromptMode::None);
+        assert_eq!(parse_prompt_mode(Some("bogus")), PromptMode::Auto);
+    }
+
+    #[test]
+    fn backend_selection_auto_order() {
+        use PromptBackend::*;
+        // Custom beats host beats qml6 beats notification.
+        assert_eq!(choose_backend(PromptMode::Auto, true, true, true), Custom);
+        assert_eq!(choose_backend(PromptMode::Auto, false, true, true), QtHost);
+        assert_eq!(choose_backend(PromptMode::Auto, false, false, true), Qml6);
+        assert_eq!(choose_backend(PromptMode::Auto, false, false, false), Notify);
+    }
+
+    #[test]
+    fn backend_selection_forced_modes() {
+        use PromptBackend::*;
+        assert_eq!(choose_backend(PromptMode::Qt, true, true, true), QtHost);
+        assert_eq!(choose_backend(PromptMode::Qt, true, false, true), None);
+        assert_eq!(choose_backend(PromptMode::Qml, true, true, true), Qml6);
+        assert_eq!(choose_backend(PromptMode::Qml, true, true, false), None);
+        // Notify is always attempted when forced, even if other
+        // front-ends are available: forcing means forcing.
+        assert_eq!(choose_backend(PromptMode::Notify, true, true, true), Notify);
+        assert_eq!(choose_backend(PromptMode::None, true, true, true), None);
     }
 
     #[test]
