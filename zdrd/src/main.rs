@@ -1,8 +1,8 @@
 mod align;
 mod args;
 mod camfind;
-mod config;
 mod capture;
+mod config;
 mod consent;
 mod engine;
 mod enroll;
@@ -50,7 +50,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("zdrd:   sface: {}", cfg.sface.display());
     if !cfg.require_ir {
         eprintln!("zdrd: WARNING: RGB-only mode (require_ir=false)");
-        eprintln!("zdrd: WARNING: a printed photo or a photo on a phone screen can pass this check");
+        eprintln!(
+            "zdrd: WARNING: a printed photo or a photo on a phone screen can pass this check"
+        );
         eprintln!("zdrd: WARNING: this mode is convenience only, not secure authentication");
     }
 

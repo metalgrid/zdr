@@ -164,6 +164,28 @@ fn cmd_enroll(args: &[String]) -> Result<(), String> {
         return Err(format!("invalid user name {user:?}"));
     }
     let proxy = proxy()?;
+    // Learn the daemon's mode read-only before enrolling. In RGB-only
+    // mode, warn loudly and require an explicit typed confirmation.
+    let (_version, require_ir): (String, bool) = proxy
+        .call("ServerInfo", &())
+        .map_err(|e| format!("ServerInfo: {e}"))?;
+    if !require_ir {
+        println!("WARNING: the daemon is in RGB-only mode (require_ir=false).");
+        println!("WARNING: a printed photo or a photo on a phone screen can pass this check.");
+        println!("WARNING: this mode is convenience only, not secure authentication.");
+        print!("Type 'yes' to enroll in RGB-only mode: ");
+        std::io::stdout()
+            .flush()
+            .map_err(|e| format!("flushing stdout: {e}"))?;
+        let answer = match read_line_from_stdin()? {
+            Some(line) => line,
+            None => String::new(),
+        };
+        if answer.trim() != "yes" {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
     let enroll_id: String = proxy
         .call("BeginEnroll", &(user.as_str(),))
         .map_err(|e| format!("BeginEnroll({user}): {e}"))?;
@@ -214,24 +236,39 @@ fn enroll_loop(
     Ok(())
 }
 
-/// Count templates in one `templates.bin` payload (header: magic
-/// "ZDRT", u16 version, u32 count, then count * 128 f32). Duplicated
-/// in miniature here so zdrctl needs no daemon/engine code.
+/// Count templates in one `templates.bin` payload (v1 header: magic
+/// "ZDRT", u16 version, u32 count; v2 adds one mode byte after the
+/// version). Then count * 128 f32. Duplicated in miniature here so
+/// zdrctl needs no daemon/engine code.
 fn count_templates(bytes: &[u8]) -> Result<usize, String> {
-    const HEADER: usize = 10;
     const DIM_BYTES: usize = 128 * 4;
-    if bytes.len() < HEADER {
+    if bytes.len() < 10 {
         return Err(format!("file too short ({} bytes)", bytes.len()));
     }
     if &bytes[0..4] != b"ZDRT" {
         return Err("bad magic (expected ZDRT)".to_string());
     }
     let version = u16::from_le_bytes([bytes[4], bytes[5]]);
-    if version != 1 {
-        return Err(format!("unsupported version {version}"));
-    }
-    let count = u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]) as usize;
-    if bytes.len() != HEADER + count * DIM_BYTES {
+    let (header, count) = match version {
+        1 => (
+            10,
+            u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]) as usize,
+        ),
+        2 => {
+            if bytes.len() < 11 {
+                return Err(format!("file too short ({} bytes)", bytes.len()));
+            }
+            if bytes[6] != 1 && bytes[6] != 2 {
+                return Err(format!("unknown mode byte {}", bytes[6]));
+            }
+            (
+                11,
+                u32::from_le_bytes([bytes[7], bytes[8], bytes[9], bytes[10]]) as usize,
+            )
+        }
+        other => return Err(format!("unsupported version {other}")),
+    };
+    if bytes.len() != header + count * DIM_BYTES {
         return Err(format!(
             "size mismatch for {count} templates (wrong dimension or corrupt)"
         ));

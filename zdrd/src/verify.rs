@@ -96,6 +96,10 @@ impl FaceVerifier {
 }
 
 impl Verifier for FaceVerifier {
+    fn require_ir(&self) -> bool {
+        FaceVerifier::require_ir(self)
+    }
+
     fn capture_for_enroll(&self, existing: &[Vec<f32>]) -> (FeedbackKind, Option<Vec<f32>>) {
         let mut guard = match self.inner.lock() {
             Ok(g) => g,
@@ -114,7 +118,12 @@ impl Verifier for FaceVerifier {
                     return (FeedbackKind::Error, None);
                 }
             };
-            crate::enroll::evaluate_capture(inner.engine.as_mut(), &paired.rgb, &paired.ir, existing)
+            crate::enroll::evaluate_capture(
+                inner.engine.as_mut(),
+                &paired.rgb,
+                &paired.ir,
+                existing,
+            )
         } else {
             let rgb_path = match &inner.rgb_camera {
                 Some(r) => r.clone(),
@@ -411,10 +420,8 @@ mod tests {
         // refuses with nomatch *before* any camera is opened (both
         // camera paths are None here, so a capture attempt would
         // return "camera" instead).
-        let dir = std::env::temp_dir().join(format!(
-            "zdrd-verify-mode-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("zdrd-verify-mode-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         let embs = vec![vec![1.0; crate::templates::EMBEDDING_DIM]];
@@ -425,7 +432,8 @@ mod tests {
         let eng = MockEngine {
             embedding: vec![1.0, 0.0],
         };
-        let verifier = FaceVerifier::with_engine(Box::new(eng), dir.clone(), None, None, 0.363, true);
+        let verifier =
+            FaceVerifier::with_engine(Box::new(eng), dir.clone(), None, None, 0.363, true);
         assert_eq!(verifier.verify("alice"), (false, "nomatch".to_string()));
         // And the mirror image: RGB daemon, IR templates.
         let mut store = TemplateStore::new(dir.clone());
@@ -435,7 +443,8 @@ mod tests {
         let eng = MockEngine {
             embedding: vec![1.0, 0.0],
         };
-        let verifier = FaceVerifier::with_engine(Box::new(eng), dir.clone(), None, None, 0.363, false);
+        let verifier =
+            FaceVerifier::with_engine(Box::new(eng), dir.clone(), None, None, 0.363, false);
         assert_eq!(verifier.verify("alice"), (false, "nomatch".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }

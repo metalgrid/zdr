@@ -128,10 +128,7 @@ fn probes_from_links(links: &[PathBuf]) -> Vec<DeviceProbe> {
         let target = match std::fs::canonicalize(link) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!(
-                    "zdrd: camfind: cannot resolve {}: {e}",
-                    link.display()
-                );
+                eprintln!("zdrd: camfind: cannot resolve {}: {e}", link.display());
                 continue;
             }
         };
@@ -222,10 +219,26 @@ mod tests {
         let probes = vec![
             // Deliberately unordered input; index1 of the RGB device
             // resolves to the same target and must not double-count.
-            probe("/dev/v4l/by-path/b-usb-0:1:1.0-video-index0", "/dev/video2", &["GREY"]),
-            probe("/dev/v4l/by-path/a-usb-0:1:1.0-video-index1", "/dev/video0", &["MJPG"]),
-            probe("/dev/v4l/by-path/a-usb-0:1:1.0-video-index0", "/dev/video0", &["MJPG", "YUYV"]),
-            probe("/dev/v4l/by-path/c-usb-0:2:1.0-video-index0", "/dev/video4", &["GREY"]),
+            probe(
+                "/dev/v4l/by-path/b-usb-0:1:1.0-video-index0",
+                "/dev/video2",
+                &["GREY"],
+            ),
+            probe(
+                "/dev/v4l/by-path/a-usb-0:1:1.0-video-index1",
+                "/dev/video0",
+                &["MJPG"],
+            ),
+            probe(
+                "/dev/v4l/by-path/a-usb-0:1:1.0-video-index0",
+                "/dev/video0",
+                &["MJPG", "YUYV"],
+            ),
+            probe(
+                "/dev/v4l/by-path/c-usb-0:2:1.0-video-index0",
+                "/dev/video4",
+                &["GREY"],
+            ),
         ];
         let found = select(&probes);
         assert_eq!(
@@ -238,8 +251,16 @@ mod tests {
         );
         // 4 links, 3 unique targets => 3 summary lines.
         assert_eq!(found.summary.len(), 3);
-        assert!(found.summary[0].contains("RGB candidate"), "{}", found.summary[0]);
-        assert!(found.summary[1].contains("IR candidate"), "{}", found.summary[1]);
+        assert!(
+            found.summary[0].contains("RGB candidate"),
+            "{}",
+            found.summary[0]
+        );
+        assert!(
+            found.summary[1].contains("IR candidate"),
+            "{}",
+            found.summary[1]
+        );
     }
 
     #[test]

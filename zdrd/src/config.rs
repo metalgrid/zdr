@@ -82,10 +82,7 @@ fn camera_spec(cli: Option<&str>, file: Option<&str>) -> Option<String> {
 
 impl ResolvedConfig {
     pub fn resolve(args: &Args, file: &FileConfig, detected: &DetectedCameras) -> ResolvedConfig {
-        let rgb_camera = match camera_spec(
-            args.rgb_camera.as_deref(),
-            file.rgb_camera.as_deref(),
-        ) {
+        let rgb_camera = match camera_spec(args.rgb_camera.as_deref(), file.rgb_camera.as_deref()) {
             Some(p) => Some(PathBuf::from(p)),
             None => detected.rgb.clone(),
         };
@@ -100,7 +97,10 @@ impl ResolvedConfig {
                 .require_ir
                 .or(file.require_ir)
                 .unwrap_or(DEFAULT_REQUIRE_IR),
-            threshold: args.threshold.or(file.threshold).unwrap_or(DEFAULT_THRESHOLD),
+            threshold: args
+                .threshold
+                .or(file.threshold)
+                .unwrap_or(DEFAULT_THRESHOLD),
             auth_dir: args
                 .auth_dir
                 .clone()
@@ -195,11 +195,17 @@ mod tests {
         cli.rgb_camera = Some("auto".to_string());
         let r = ResolvedConfig::resolve(&cli, &FileConfig::default(), &detected());
         assert_eq!(r.rgb_camera, detected().rgb);
-        assert!(ResolvedConfig::needs_detection(&cli, &FileConfig::default()));
+        assert!(ResolvedConfig::needs_detection(
+            &cli,
+            &FileConfig::default()
+        ));
 
         cli.rgb_camera = Some("/dev/explicit-rgb".to_string());
         cli.ir_camera = Some("/dev/explicit-ir".to_string());
-        assert!(!ResolvedConfig::needs_detection(&cli, &FileConfig::default()));
+        assert!(!ResolvedConfig::needs_detection(
+            &cli,
+            &FileConfig::default()
+        ));
     }
 
     #[test]
@@ -207,7 +213,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("zdrd-config-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
-        assert_eq!(load_file(&dir.join("absent.toml")).expect("missing ok"), None);
+        assert_eq!(
+            load_file(&dir.join("absent.toml")).expect("missing ok"),
+            None
+        );
 
         let bad = dir.join("bad.toml");
         std::fs::write(&bad, "threshold = \"not a float\"\n").expect("write bad");

@@ -102,7 +102,8 @@ pub fn encode_templates_with_mode(templates: &[Vec<f32>], mode: TemplateMode) ->
     Ok(out)
 }
 
-/// Serialize embeddings as IR-mode v2 (convenience wrapper).
+/// Serialize embeddings as IR-mode v2 (convenience wrapper, used by tests).
+#[allow(dead_code)]
 pub fn encode_templates(templates: &[Vec<f32>]) -> Result<Vec<u8>> {
     encode_templates_with_mode(templates, TemplateMode::Ir)
 }
@@ -183,10 +184,12 @@ pub fn decode_templates_with_mode(bytes: &[u8]) -> Result<(TemplateMode, Vec<Vec
 }
 
 /// Parse a `templates.bin` payload, discarding the mode.
+#[allow(dead_code)]
 pub fn decode_templates(bytes: &[u8]) -> Result<Vec<Vec<f32>>> {
     Ok(decode_templates_with_mode(bytes)?.1)
 }
 
+#[allow(dead_code)]
 pub fn load_templates_file(path: &Path) -> Result<Vec<Vec<f32>>> {
     Ok(load_templates_file_with_mode(path)?.1)
 }
@@ -443,7 +446,8 @@ mod tests {
     fn store_round_trip() {
         let dir = temp_dir("roundtrip");
         let templates = vec![emb(0.5), emb(-0.25)];
-        let path = write_templates_file(&dir, "alice", &templates, TemplateMode::Ir).expect("write");
+        let path =
+            write_templates_file(&dir, "alice", &templates, TemplateMode::Ir).expect("write");
         assert_eq!(load_templates_file(&path).expect("load"), templates);
         #[cfg(unix)]
         {
