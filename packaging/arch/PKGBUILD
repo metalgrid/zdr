@@ -73,5 +73,6 @@ package() {
         "$pkgdir/etc/xdg/autostart/zdr-agent.desktop"
     install -Dm644 packaging/arch/zdr.tmpfiles \
         "$pkgdir/usr/lib/tmpfiles.d/zdr.conf"
+    install -Dm644 zdrd/zdrd.toml.example "$pkgdir/etc/zdr/zdrd.toml"
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
 }
