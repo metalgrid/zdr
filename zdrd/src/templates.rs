@@ -225,10 +225,6 @@ impl TemplateStore {
         }
     }
 
-    pub fn auth_dir(&self) -> &Path {
-        &self.auth_dir
-    }
-
     /// Startup pass: load templates for every user directory present.
     pub fn load_all(&mut self, engine: &mut dyn FaceEngine) {
         let users: Vec<String> = match std::fs::read_dir(&self.auth_dir) {

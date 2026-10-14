@@ -3,6 +3,7 @@ mod args;
 mod capture;
 mod consent;
 mod engine;
+mod enroll;
 mod error;
 mod feedback;
 mod service;

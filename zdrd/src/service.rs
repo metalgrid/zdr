@@ -26,6 +26,7 @@
 //! CaptureVerify, after approval, and consumes the request exactly once.
 
 use crate::consent::{Caller, Consent, ConsentError};
+use crate::enroll::{EnrollError, Enrollments};
 use crate::feedback::FeedbackKind;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
@@ -104,6 +105,7 @@ pub trait Verifier: Send + Sync {
 
 pub struct Authenticator {
     consent: Arc<Mutex<Consent>>,
+    enrollments: Arc<Mutex<Enrollments>>,
     verifier: Arc<dyn Verifier>,
 }
 
@@ -111,8 +113,17 @@ impl Authenticator {
     pub fn new(verifier: Arc<dyn Verifier>) -> Self {
         Authenticator {
             consent: Arc::new(Mutex::new(Consent::new())),
+            enrollments: Arc::new(Mutex::new(Enrollments::new())),
             verifier,
         }
+    }
+
+    fn lock_enrollments(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, Enrollments>, AuthError> {
+        self.enrollments
+            .lock()
+            .map_err(|_| AuthError::Failed("enrollment state poisoned".into()))
     }
 
     fn lock_consent(&self) -> Result<std::sync::MutexGuard<'_, Consent>, AuthError> {
@@ -386,6 +397,158 @@ impl Authenticator {
         require_root(conn, &header).await?;
         let removed = self.lock_consent()?.cancel(request_id);
         eprintln!("zdrd: Cancel id={request_id} removed={removed}");
+        Ok(())
+    }
+
+    #[zbus(out_args("enroll_id"))]
+    async fn begin_enroll(
+        &self,
+        user: &str,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] conn: &Connection,
+    ) -> Result<String, AuthError> {
+        require_root(conn, &header).await?;
+        if !crate::templates::valid_user(user) || uid_for_user(user).is_none() {
+            return Err(AuthError::InvalidArgs(format!("unknown user {user:?}")));
+        }
+        let enroll_id = new_request_id()?;
+        match self
+            .lock_enrollments()?
+            .begin(&enroll_id, user, Instant::now())
+        {
+            Ok(()) => {
+                eprintln!("zdrd: BeginEnroll user={user} id={enroll_id}");
+                Ok(enroll_id)
+            }
+            Err(EnrollError::Busy) => Err(AuthError::Busy(EnrollError::Busy.to_string())),
+            Err(e) => Err(AuthError::Failed(e.to_string())),
+        }
+    }
+
+    #[zbus(out_args("state", "captured", "needed", "kind"))]
+    async fn enroll_capture(
+        &self,
+        enroll_id: &str,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<(String, i32, i32, String), AuthError> {
+        require_root(conn, &header).await?;
+        // Snapshot session state, then capture without holding the
+        // enrollment lock across blocking camera work.
+        let (user, existing, captured_before) = {
+            let mut guard = self.lock_enrollments()?;
+            let now = Instant::now();
+            match (
+                guard.user_for(enroll_id, now),
+                guard.embeddings_for(enroll_id, now),
+                guard.captured_for(enroll_id, now),
+            ) {
+                (Ok(u), Ok(e), Ok(c)) => (u, e, c),
+                (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+                    return Err(AuthError::Failed(e.to_string()))
+                }
+            }
+        };
+        emit_feedback(&emitter, enroll_id, FeedbackKind::Capturing).await;
+        let verifier = Arc::clone(&self.verifier);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("zdrd-enroll-capture".to_string())
+            .spawn(move || {
+                let _ = tx.send(verifier.capture_for_enroll(&existing));
+            });
+        if let Err(e) = spawned {
+            eprintln!("zdrd: EnrollCapture spawn failed for user={user}: {e}");
+            emit_feedback(&emitter, enroll_id, FeedbackKind::Error).await;
+            return Ok((
+                "rejected".to_string(),
+                captured_before as i32,
+                crate::enroll::NEEDED as i32,
+                FeedbackKind::Error.as_str().to_string(),
+            ));
+        }
+        let deadline = Instant::now() + CAPTURE_TIMEOUT;
+        let (kind, embedding) = loop {
+            match rx.try_recv() {
+                Ok(result) => break result,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    emit_feedback(&emitter, enroll_id, FeedbackKind::Error).await;
+                    return Ok((
+                        "rejected".to_string(),
+                        captured_before as i32,
+                        crate::enroll::NEEDED as i32,
+                        FeedbackKind::Error.as_str().to_string(),
+                    ));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            if Instant::now() >= deadline {
+                eprintln!("zdrd: EnrollCapture timed out for user={user}");
+                emit_feedback(&emitter, enroll_id, FeedbackKind::Error).await;
+                return Ok((
+                    "rejected".to_string(),
+                    captured_before as i32,
+                    crate::enroll::NEEDED as i32,
+                    FeedbackKind::Error.as_str().to_string(),
+                ));
+            }
+            async_io::Timer::after(Duration::from_millis(25)).await;
+        };
+        let attempt = self
+            .lock_enrollments()?
+            .apply_capture(enroll_id, Instant::now(), kind, embedding)
+            .map_err(|e| AuthError::Failed(e.to_string()))?;
+        emit_feedback(&emitter, enroll_id, attempt.kind).await;
+        eprintln!(
+            "zdrd: EnrollCapture user={user} state={} captured={}/{} kind={}",
+            attempt.state.as_str(),
+            attempt.captured,
+            attempt.needed,
+            attempt.kind.as_str()
+        );
+        Ok((
+            attempt.state.as_str().to_string(),
+            attempt.captured as i32,
+            attempt.needed as i32,
+            attempt.kind.as_str().to_string(),
+        ))
+    }
+
+    #[zbus(out_args("stored"))]
+    async fn finish_enroll(
+        &self,
+        enroll_id: &str,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<i32, AuthError> {
+        require_root(conn, &header).await?;
+        let (user, embeddings) = self
+            .lock_enrollments()?
+            .ready_snapshot(enroll_id, Instant::now())
+            .map_err(|e| AuthError::Failed(e.to_string()))?;
+        // Only consume the session once the store write has succeeded,
+        // so a failed finish can be retried before expiry.
+        let stored = self
+            .verifier
+            .finish_enroll_store(&user, &embeddings)
+            .map_err(AuthError::Failed)?;
+        self.lock_enrollments()?.cancel(enroll_id);
+        emit_feedback(&emitter, enroll_id, FeedbackKind::Stored).await;
+        eprintln!("zdrd: FinishEnroll user={user} stored={stored}");
+        Ok(stored as i32)
+    }
+
+    async fn cancel_enroll(
+        &self,
+        enroll_id: &str,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] conn: &Connection,
+    ) -> Result<(), AuthError> {
+        require_root(conn, &header).await?;
+        let removed = self.lock_enrollments()?.cancel(enroll_id);
+        eprintln!("zdrd: CancelEnroll id={enroll_id} removed={removed}");
         Ok(())
     }
 

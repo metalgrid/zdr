@@ -5,6 +5,7 @@ use crate::align;
 use crate::capture::{self, gray_to_rgb};
 use crate::engine::{FaceEngine, OnnxEngine};
 use crate::error::DaemonError;
+use crate::feedback::FeedbackKind;
 use crate::service::Verifier;
 use crate::templates::TemplateStore;
 use image::{GrayImage, RgbImage};
@@ -58,6 +59,38 @@ impl FaceVerifier {
 }
 
 impl Verifier for FaceVerifier {
+    fn capture_for_enroll(&self, existing: &[Vec<f32>]) -> (FeedbackKind, Option<Vec<f32>>) {
+        let mut guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(_) => return (FeedbackKind::Error, None),
+        };
+        let inner: &mut FaceInner = &mut guard;
+        let paired = match capture::capture_paired(&inner.rgb_camera, &inner.ir_camera) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("zdrd: enroll capture failed: {e}");
+                return (FeedbackKind::Error, None);
+            }
+        };
+        crate::enroll::evaluate_capture(
+            inner.engine.as_mut(),
+            &paired.rgb,
+            &paired.ir,
+            existing,
+        )
+    }
+
+    fn finish_enroll_store(&self, user: &str, embeddings: &[Vec<f32>]) -> Result<usize, String> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| "verifier state poisoned".to_string())?;
+        guard
+            .templates
+            .store(user, embeddings)
+            .map_err(|e| e.to_string())
+    }
+
     fn verify(&self, user: &str) -> (bool, String) {
         let mut guard = match self.inner.lock() {
             Ok(g) => g,
