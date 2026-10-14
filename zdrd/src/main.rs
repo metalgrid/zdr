@@ -1,57 +1,56 @@
 mod args;
-mod recognize;
-mod snap;
-
-use std::sync::Mutex;
+mod consent;
+mod service;
 
 use args::Args;
 use clap::Parser;
-use event_listener::Listener;
-use recognize::Recognizer;
-use snap::Snap;
-use zbus::blocking::connection::Builder;
+use service::{Authenticator, UnavailableVerifier};
+use std::sync::Arc;
 
-fn main() -> Result<(), zbus::Error> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let mut rec = Recognizer::new(
-        args.r,
-        args.ddb.as_str(),
-        args.pdb.as_str(),
-        args.rdb.as_str(),
-    )
-    .unwrap();
+    eprintln!(
+        "zdrd: starting (rgb={}, ir={}, auth-dir={}, threshold={})",
+        args.rgb_camera,
+        args.ir_camera,
+        args.auth_dir.display(),
+        args.threshold
+    );
 
-    rec.load_auth_images(args.auth_dir.as_str()).unwrap();
-
-    let snap = Snap::new(args.camera.as_str()).unwrap();
-
-    let svc = ZdrService {
-        event: event_listener::Event::new(),
-        rec: Mutex::new(rec),
-        snap: snap,
-    };
-    let listener = svc.event.listen();
-
-    let _bus = Builder::system()?
+    let svc = Authenticator::new(Arc::new(UnavailableVerifier));
+    let _conn = zbus::connection::Builder::system()?
         .name("org.zdr.Authenticator")?
         .serve_at("/org/zdr/Authenticator", svc)?
-        .build()?;
+        .build()
+        .await?;
+    eprintln!("zdrd: listening on system bus as org.zdr.Authenticator");
 
-    listener.wait();
+    shutdown_signal().await;
+    eprintln!("zdrd: shutting down");
     Ok(())
 }
 
-struct ZdrService {
-    event: event_listener::Event,
-    rec: Mutex<Recognizer>, // This is awful, but I've been banging my head against the wall for hours
-    snap: Snap,
-}
-
-#[zbus::interface(name = "org.zdr.Authenticator")]
-impl ZdrService {
-    fn verify(&self, user: &str) -> Result<bool, zbus::fdo::Error> {
-        let img = self.snap.take_snap().unwrap();
-        let rec = self.rec.lock().unwrap();
-        Ok(rec.recognize(&img))
+/// Resolve on SIGINT or SIGTERM so systemd stops are graceful.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            eprintln!("zdrd: ctrl-c handler failed: {e}");
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => eprintln!("zdrd: SIGTERM handler failed: {e}"),
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
     }
 }
