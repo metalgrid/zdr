@@ -1,12 +1,12 @@
 extern crate pam;
 
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::sync::mpsc;
 use std::time::Duration;
 
 use pam::constants::{PamFlag, PamResultCode, PAM_PROMPT_ECHO_ON, PAM_TEXT_INFO};
 use pam::conv::Conv;
-use pam::items::{RHost, Service, Tty, User};
+use pam::items::{AuthTok, RHost, Service, Tty, User};
 use pam::module::{PamHandle, PamHooks};
 use zbus::blocking::Connection;
 
@@ -16,7 +16,8 @@ use zbus::blocking::Connection;
 /// worst-case D-Bus wait inside `pam_sm_authenticate`:
 ///
 /// * agent channel:    5 s BeginAuth + 35 s AwaitConsent + 15 s CaptureVerify
-///   (+ 2 s Cancel on an error path) ≈ 57 s
+///   (or CaptureVerifyAuthtok in mode=authtok, same ceiling; it replaces,
+///   not adds to, CaptureVerify) (+ 2 s Cancel on an error path) ≈ 57 s
 /// * terminal channel: 5 s BeginAuth + 5 s Respond + 15 s CaptureVerify
 ///   (+ 2 s Cancel on an error path) ≈ 27 s
 ///
@@ -51,9 +52,7 @@ impl PamHooks for PamZdr {
         // vice versa.
         let mode = match parse_mode(&args) {
             Ok(mode) => mode,
-            Err(value) => {
-                return fail("module arguments", &format!("unknown mode {value:?}"))
-            }
+            Err(value) => return fail("module arguments", &format!("unknown mode {value:?}")),
         };
 
         // Do NOT use PamHandle::get_user from pam-bindings 0.1.1: it passes
@@ -113,7 +112,7 @@ impl PamHooks for PamZdr {
                 }
                 match call_await_consent(&connection, &request_id) {
                     Ok(outcome) => match parse_outcome(&outcome) {
-                        Some(consent) => finish(mode, &connection, &request_id, consent),
+                        Some(consent) => finish(pamh, mode, &connection, &request_id, consent),
                         None => {
                             cancel_best_effort(&connection, &request_id);
                             fail("AwaitConsent", "unknown outcome string")
@@ -148,7 +147,7 @@ impl PamHooks for PamZdr {
                 }
                 // The daemon records Respond(true) as approval; capturing is
                 // the next and only remaining step.
-                finish(mode, &connection, &request_id, Consent::Approved)
+                finish(pamh, mode, &connection, &request_id, Consent::Approved)
             }
             other => {
                 cancel_best_effort(&connection, &request_id);
@@ -195,6 +194,7 @@ fn parse_outcome(outcome: &str) -> Option<Consent> {
 /// Shared tail of both consent channels: only an approved request reaches
 /// `CaptureVerify`; success requires it to report a match.
 fn finish(
+    pamh: &mut PamHandle,
     mode: Mode,
     connection: &Connection,
     request_id: &str,
@@ -203,17 +203,105 @@ fn finish(
     if !matches!(consent, Consent::Approved) {
         return decide_mode(mode, &consent, None, false, false);
     }
+    match mode {
+        Mode::Decide => finish_decide(connection, request_id, &consent),
+        Mode::Authtok => finish_authtok(pamh, connection, request_id, &consent),
+    }
+}
+
+/// Decide-mode tail: `CaptureVerify`; a match alone authenticates.
+fn finish_decide(connection: &Connection, request_id: &str, consent: &Consent) -> PamResultCode {
     match call_capture_verify(connection, request_id) {
         Ok((matched, reason)) => {
             eprintln!("pam_zdr: CaptureVerify matched={matched} reason={reason}");
-            decide_mode(mode, &consent, Some(matched), false, false)
+            decide_mode(Mode::Decide, consent, Some(matched), false, false)
         }
         Err(e) => {
             eprintln!("pam_zdr: CaptureVerify: {e}");
             cancel_best_effort(connection, request_id);
-            decide_mode(mode, &consent, None, false, false)
+            decide_mode(Mode::Decide, consent, None, false, false)
         }
     }
+}
+
+/// Authtok-mode tail: `CaptureVerifyAuthtok`; a match never authenticates
+/// by itself. On a match with a sealed password, deposit it as
+/// `PAM_AUTHTOK` and return `PAM_IGNORE` so `pam_unix` (`try_first_pass`)
+/// validates it and downstream modules consume it as in a password login.
+/// On a match with no sealed password, return `PAM_IGNORE` with no token
+/// set so the stack prompts normally. The password itself is never logged.
+fn finish_authtok(
+    pamh: &mut PamHandle,
+    connection: &Connection,
+    request_id: &str,
+    consent: &Consent,
+) -> PamResultCode {
+    match call_capture_verify_authtok(connection, request_id) {
+        Ok((matched, reason, mut password)) => {
+            eprintln!("pam_zdr: CaptureVerifyAuthtok matched={matched} reason={reason}");
+            let token_present = !password.is_empty();
+            let token_set_ok = if matched && token_present {
+                let ok = set_authtok(pamh, &password);
+                if ok {
+                    eprintln!("pam_zdr: token set for pam_unix");
+                } else {
+                    eprintln!("pam_zdr: token set for pam_unix failed");
+                }
+                ok
+            } else {
+                false
+            };
+            wipe(&mut password);
+            decide_mode(
+                Mode::Authtok,
+                consent,
+                Some(matched),
+                token_present,
+                token_set_ok,
+            )
+        }
+        Err(e) => {
+            eprintln!("pam_zdr: CaptureVerifyAuthtok: {e}");
+            cancel_best_effort(connection, request_id);
+            decide_mode(Mode::Authtok, consent, None, false, false)
+        }
+    }
+}
+
+/// Zero a buffer in place. Hand-rolled (no new crates); `black_box` keeps
+/// the optimizer from eliding writes to a buffer that is about to drop.
+fn wipe(buf: &mut [u8]) {
+    for byte in buf.iter_mut() {
+        *byte = 0;
+    }
+    let _ = std::hint::black_box(buf);
+}
+
+/// Store `password` as the handle's `PAM_AUTHTOK` item. Returns success.
+///
+/// No direct `pam_set_item` FFI and no new dependency are needed:
+/// pam-bindings 0.1.1 does expose setting string items via
+/// `PamHandle::set_item_str`, generic over `pam::items::Item`, and
+/// `items::AuthTok` (item type 6) is a `CStr` item whose `into_raw` yields
+/// exactly the `const char *` `pam_set_item` expects. (The crate does not
+/// re-export its `libc`, so this also avoids adding `libc` just for FFI.)
+///
+/// Lifetime evidence: `pam_set_item(3)` (Linux-PAM manual) states "For this
+/// a copy of the object pointed to by the item argument is created", so
+/// PAM owns its copy once the call returns and our `CString` may be wiped
+/// and dropped immediately afterwards. A password containing an interior
+/// NUL cannot be a C string token: `CString::new` fails and we report
+/// failure (the caller fails closed) instead of truncating it.
+fn set_authtok(pamh: &mut PamHandle, password: &[u8]) -> bool {
+    let owned = match CString::new(password) {
+        Ok(cstring) => cstring,
+        Err(_) => return false,
+    };
+    let result = pamh.set_item_str(AuthTok(owned.as_c_str()));
+    // Recover the CString's buffer and wipe our copy; PAM has its own.
+    let mut bytes = owned.into_bytes();
+    wipe(&mut bytes);
+    result.is_ok()
 }
 
 /// Run `call` on a worker thread and wait at most `timeout` for its result.
@@ -304,6 +392,24 @@ fn call_capture_verify(
     })
 }
 
+/// `CaptureVerifyAuthtok(request_id) -> (matched, reason, password)`.
+/// One shot, root-only on the daemon side, only ever called after explicit
+/// approval. `password` is the TPM-sealed login password and is non-empty
+/// only when matched and a sealed password exists; it must never be logged.
+fn call_capture_verify_authtok(
+    connection: &Connection,
+    request_id: &str,
+) -> Result<(bool, String, Vec<u8>), String> {
+    let connection = connection.clone();
+    let request_id = request_id.to_string();
+    timed_call(CAPTURE_VERIFY_TIMEOUT, move || {
+        let proxy = ZdrAuthenticatorProxyBlocking::new(&connection).map_err(|e| e.to_string())?;
+        proxy
+            .capture_verify_authtok(&request_id)
+            .map_err(|e| e.to_string())
+    })
+}
+
 /// `Cancel(request_id) -> ()`, best-effort: the result is deliberately
 /// ignored by callers on error paths.
 fn cancel_best_effort(connection: &Connection, request_id: &str) {
@@ -331,6 +437,7 @@ trait ZdrAuthenticator {
     fn respond(&self, request_id: &str, approved: bool) -> zbus::Result<()>;
     fn await_consent(&self, request_id: &str) -> zbus::Result<String>;
     fn capture_verify(&self, request_id: &str) -> zbus::Result<(bool, String)>;
+    fn capture_verify_authtok(&self, request_id: &str) -> zbus::Result<(bool, String, Vec<u8>)>;
     fn cancel(&self, request_id: &str) -> zbus::Result<()>;
 }
 
@@ -653,10 +760,7 @@ mod tests {
             mode_of(&["debug", "mode=authtok", "nullok"]),
             Ok(Mode::Authtok)
         );
-        assert_eq!(
-            mode_of(&["mode=authtok", "mode=decide"]),
-            Ok(Mode::Decide)
-        );
+        assert_eq!(mode_of(&["mode=authtok", "mode=decide"]), Ok(Mode::Decide));
         assert_eq!(
             mode_of(&["mode=decide", "debug", "mode=authtok"]),
             Ok(Mode::Authtok)
@@ -741,14 +845,13 @@ mod tests {
             for matched in [None, Some(false), Some(true)] {
                 for token_present in [false, true] {
                     for token_set_ok in [false, true] {
-                        let expected = if c == 0
-                            && matched == Some(true)
-                            && !(token_present && !token_set_ok)
-                        {
-                            PamResultCode::PAM_IGNORE
-                        } else {
-                            PamResultCode::PAM_AUTH_ERR
-                        };
+                        let expected =
+                            if c == 0 && matched == Some(true) && !(token_present && !token_set_ok)
+                            {
+                                PamResultCode::PAM_IGNORE
+                            } else {
+                                PamResultCode::PAM_AUTH_ERR
+                            };
                         assert_eq!(
                             decide_mode(
                                 Mode::Authtok,
@@ -764,6 +867,16 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn wipe_zeroes_buffer() {
+        let mut buf = b"hunter2".to_vec();
+        wipe(&mut buf);
+        assert_eq!(buf, vec![0u8; 7]);
+        let mut empty: Vec<u8> = Vec::new();
+        wipe(&mut empty);
+        assert!(empty.is_empty());
     }
 
     #[test]
