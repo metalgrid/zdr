@@ -72,12 +72,7 @@ impl Verifier for FaceVerifier {
                 return (FeedbackKind::Error, None);
             }
         };
-        crate::enroll::evaluate_capture(
-            inner.engine.as_mut(),
-            &paired.rgb,
-            &paired.ir,
-            existing,
-        )
+        crate::enroll::evaluate_capture(inner.engine.as_mut(), &paired.rgb, &paired.ir, existing)
     }
 
     fn finish_enroll_store(&self, user: &str, embeddings: &[Vec<f32>]) -> Result<usize, String> {

@@ -205,6 +205,9 @@ impl Enrollments {
     }
 
     /// Capture from already-grabbed frames through the quality gates.
+    /// The live D-Bus path splits snapshot/capture/apply across a
+    /// worker thread; this fused form drives the state machine in tests.
+    #[cfg(test)]
     pub fn capture(
         &mut self,
         enroll_id: &str,
@@ -385,7 +388,9 @@ mod tests {
     fn good_capture_stores_and_counts() {
         let (mut e, now) = setup();
         let mut eng = MockEngine::good(vec![1.0, 0.0]);
-        let a = e.capture("enr1", now, &mut eng, &rgb(), &ir(128)).expect("capture");
+        let a = e
+            .capture("enr1", now, &mut eng, &rgb(), &ir(128))
+            .expect("capture");
         assert_eq!(a.state, EnrollState::Captured);
         assert_eq!((a.captured, a.needed), (1, NEEDED));
         assert_eq!(a.kind, FeedbackKind::Stored);
@@ -395,13 +400,15 @@ mod tests {
     fn face_count_gates() {
         let (mut e, now) = setup();
         for (detects, want) in [
-            (vec![0, 1], FeedbackKind::NoFace),           // IR: none
-            (vec![2, 1], FeedbackKind::MultipleFaces),   // IR: two
-            (vec![1, 0], FeedbackKind::NoFace),          // RGB: none
-            (vec![1, 2], FeedbackKind::MultipleFaces),   // RGB: two
+            (vec![0, 1], FeedbackKind::NoFace),        // IR: none
+            (vec![2, 1], FeedbackKind::MultipleFaces), // IR: two
+            (vec![1, 0], FeedbackKind::NoFace),        // RGB: none
+            (vec![1, 2], FeedbackKind::MultipleFaces), // RGB: two
         ] {
             let mut eng = MockEngine::new(&detects, vec![vec![1.0, 0.0]]);
-            let a = e.capture("enr1", now, &mut eng, &rgb(), &ir(128)).expect("capture");
+            let a = e
+                .capture("enr1", now, &mut eng, &rgb(), &ir(128))
+                .expect("capture");
             assert_eq!(a.state, EnrollState::Rejected, "{detects:?}");
             assert_eq!(a.kind, want, "{detects:?}");
             assert_eq!(a.captured, 0, "rejections never store");
@@ -412,10 +419,14 @@ mod tests {
     fn brightness_gates() {
         let (mut e, now) = setup();
         let mut eng = MockEngine::good(vec![1.0, 0.0]);
-        let a = e.capture("enr1", now, &mut eng, &rgb(), &ir(10)).expect("dark");
+        let a = e
+            .capture("enr1", now, &mut eng, &rgb(), &ir(10))
+            .expect("dark");
         assert_eq!(a.kind, FeedbackKind::TooDark);
         let mut eng = MockEngine::good(vec![1.0, 0.0]);
-        let a = e.capture("enr1", now, &mut eng, &rgb(), &ir(250)).expect("bright");
+        let a = e
+            .capture("enr1", now, &mut eng, &rgb(), &ir(250))
+            .expect("bright");
         assert_eq!(a.kind, FeedbackKind::TooBright);
         // Boundary values pass.
         for level in [20u8, 230] {
@@ -433,16 +444,21 @@ mod tests {
     fn duplicate_pose_rejected() {
         let (mut e, now) = setup();
         let mut eng = MockEngine::good(vec![1.0, 0.0]);
-        e.capture("enr1", now, &mut eng, &rgb(), &ir(128)).expect("first");
+        e.capture("enr1", now, &mut eng, &rgb(), &ir(128))
+            .expect("first");
         // Identical embedding: cosine 1.0 >= 0.995.
         let mut eng = MockEngine::good(vec![1.0, 0.0]);
-        let a = e.capture("enr1", now, &mut eng, &rgb(), &ir(128)).expect("dup");
+        let a = e
+            .capture("enr1", now, &mut eng, &rgb(), &ir(128))
+            .expect("dup");
         assert_eq!(a.state, EnrollState::Rejected);
         assert_eq!(a.kind, FeedbackKind::DuplicatePose);
         assert_eq!(a.captured, 1);
         // Orthogonal embedding is a new pose and stores.
         let mut eng = MockEngine::good(vec![0.0, 1.0]);
-        let a = e.capture("enr1", now, &mut eng, &rgb(), &ir(128)).expect("new pose");
+        let a = e
+            .capture("enr1", now, &mut eng, &rgb(), &ir(128))
+            .expect("new pose");
         assert_eq!(a.state, EnrollState::Captured);
         assert_eq!(a.captured, 2);
     }
@@ -461,7 +477,9 @@ mod tests {
             .collect();
         for (i, emb) in bases.iter().enumerate() {
             let mut eng = MockEngine::good(emb.clone());
-            let a = e.capture("enr1", now, &mut eng, &rgb(), &ir(128)).expect("capture");
+            let a = e
+                .capture("enr1", now, &mut eng, &rgb(), &ir(128))
+                .expect("capture");
             if i + 1 < NEEDED {
                 assert_eq!(a.state, EnrollState::Captured);
             } else {
@@ -489,10 +507,7 @@ mod tests {
     #[test]
     fn finish_writes_store_in_temp_dir() {
         // State machine -> template store integration (temp dir, no bus).
-        let dir = std::env::temp_dir().join(format!(
-            "zdrd-enroll-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("zdrd-enroll-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         let (mut e, now) = setup();
@@ -506,7 +521,8 @@ mod tests {
             .collect();
         for emb in &bases {
             let mut eng = MockEngine::good(emb.clone());
-            e.capture("enr1", now, &mut eng, &rgb(), &ir(128)).expect("capture");
+            e.capture("enr1", now, &mut eng, &rgb(), &ir(128))
+                .expect("capture");
         }
         let (user, embs) = e.ready_snapshot("enr1", now).expect("ready");
         let mut store = crate::templates::TemplateStore::new(dir.clone());
@@ -514,9 +530,9 @@ mod tests {
         assert_eq!(stored, NEEDED);
         assert!(e.cancel("enr1"), "session consumed after finish");
         // Reloaded from disk by a fresh store view of the same file.
-        let loaded = crate::templates::load_templates_file(
-            &crate::templates::templates_bin_path(&dir, "alice"),
-        )
+        let loaded = crate::templates::load_templates_file(&crate::templates::templates_bin_path(
+            &dir, "alice",
+        ))
         .expect("load");
         assert_eq!(loaded, bases);
         assert_eq!(store.get("alice").len(), NEEDED);

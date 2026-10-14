@@ -122,7 +122,11 @@ pub fn load_templates_file(path: &Path) -> Result<Vec<Vec<f32>>> {
 
 /// Atomically write `templates.bin` for `user` (temp file + rename),
 /// mode 0600 on the file (and 0700 on the user dir where we create it).
-pub fn write_templates_file(auth_dir: &Path, user: &str, templates: &[Vec<f32>]) -> Result<PathBuf> {
+pub fn write_templates_file(
+    auth_dir: &Path,
+    user: &str,
+    templates: &[Vec<f32>],
+) -> Result<PathBuf> {
     if !valid_user(user) {
         return Err(DaemonError::Invalid(format!("invalid user name {user:?}")));
     }
@@ -138,8 +142,8 @@ pub fn write_templates_file(auth_dir: &Path, user: &str, templates: &[Vec<f32>])
     // Temp file in the same directory so rename stays on one filesystem.
     let tmp_path = dir.join(format!(".templates.bin.tmp-{}", std::process::id()));
     let write_result = (|| -> Result<()> {
-        let mut f = std::fs::File::create(&tmp_path)
-            .map_err(|e| crate::error::io_at(&tmp_path, e))?;
+        let mut f =
+            std::fs::File::create(&tmp_path).map_err(|e| crate::error::io_at(&tmp_path, e))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -148,10 +152,10 @@ pub fn write_templates_file(auth_dir: &Path, user: &str, templates: &[Vec<f32>])
         }
         f.write_all(&bytes)
             .map_err(|e| crate::error::io_at(&tmp_path, e))?;
-        f.sync_all().map_err(|e| crate::error::io_at(&tmp_path, e))?;
+        f.sync_all()
+            .map_err(|e| crate::error::io_at(&tmp_path, e))?;
         drop(f);
-        std::fs::rename(&tmp_path, &final_path)
-            .map_err(|e| crate::error::io_at(&final_path, e))?;
+        std::fs::rename(&tmp_path, &final_path).map_err(|e| crate::error::io_at(&final_path, e))?;
         Ok(())
     })();
     if write_result.is_err() {
@@ -282,9 +286,9 @@ impl TemplateStore {
                         embs.len(),
                         p.display()
                     ),
-                    Err(e) => eprintln!(
-                        "zdrd: templates user={user}: PNG import write failed: {e}"
-                    ),
+                    Err(e) => {
+                        eprintln!("zdrd: templates user={user}: PNG import write failed: {e}")
+                    }
                 }
             }
             let count = embs.len();

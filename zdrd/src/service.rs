@@ -78,11 +78,7 @@ pub trait Verifier: Send + Sync {
     /// The default threads the callback around `verify`; implementors
     /// may emit finer-grained kinds internally as long as the terminal
     /// kind still comes from `FeedbackKind::terminal_for_verify`.
-    fn verify_with_feedback(
-        &self,
-        user: &str,
-        feedback: &dyn Fn(FeedbackKind),
-    ) -> (bool, String) {
+    fn verify_with_feedback(&self, user: &str, feedback: &dyn Fn(FeedbackKind)) -> (bool, String) {
         feedback(FeedbackKind::Capturing);
         let (matched, reason) = self.verify(user);
         feedback(FeedbackKind::terminal_for_verify(matched, &reason));
@@ -118,9 +114,7 @@ impl Authenticator {
         }
     }
 
-    fn lock_enrollments(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, Enrollments>, AuthError> {
+    fn lock_enrollments(&self) -> Result<std::sync::MutexGuard<'_, Enrollments>, AuthError> {
         self.enrollments
             .lock()
             .map_err(|_| AuthError::Failed("enrollment state poisoned".into()))
