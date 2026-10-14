@@ -4,6 +4,7 @@ mod capture;
 mod consent;
 mod engine;
 mod error;
+mod feedback;
 mod service;
 mod templates;
 mod verify;

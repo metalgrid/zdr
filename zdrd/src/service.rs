@@ -10,7 +10,15 @@
 //!   {"match","nomatch","noface-ir","noface-rgb","not-approved","expired",
 //!    "camera","engine"}
 //! - `Cancel(request_id) -> ()`
+//! - `BeginEnroll(user) -> (enroll_id)`, `EnrollCapture(enroll_id) ->
+//!   (state, captured, needed, kind)`, `FinishEnroll(enroll_id) ->
+//!   (stored)`, `CancelEnroll(enroll_id) -> ()` — root only (Step 11)
 //! - Signal `AuthRequested(request_id, user, service, tty, label)`
+//! - Signal `AuthFeedback(request_id, kind, message)` — emitted during
+//!   CaptureVerify and enrollment captures; for enrollment the first
+//!   argument carries the enroll_id. kind in {"capturing","no-face",
+//!   "multiple-faces","too-dark","too-bright","duplicate-pose",
+//!   "matched","not-matched","stored","error"}
 //!
 //! Authorization: BeginAuth/AwaitConsent/CaptureVerify/Cancel accept uid 0
 //! callers only. Respond accepts uid 0, or the registered agent connection
@@ -18,6 +26,7 @@
 //! CaptureVerify, after approval, and consumes the request exactly once.
 
 use crate::consent::{Caller, Consent, ConsentError};
+use crate::feedback::FeedbackKind;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -62,6 +71,35 @@ impl From<ConsentError> for AuthError {
 /// string, never a panic.
 pub trait Verifier: Send + Sync {
     fn verify(&self, user: &str) -> (bool, String);
+
+    /// Verify with streamed feedback: `capturing` before capture, then
+    /// exactly one terminal kind matching the `(matched, reason)` result.
+    /// The default threads the callback around `verify`; implementors
+    /// may emit finer-grained kinds internally as long as the terminal
+    /// kind still comes from `FeedbackKind::terminal_for_verify`.
+    fn verify_with_feedback(
+        &self,
+        user: &str,
+        feedback: &dyn Fn(FeedbackKind),
+    ) -> (bool, String) {
+        feedback(FeedbackKind::Capturing);
+        let (matched, reason) = self.verify(user);
+        feedback(FeedbackKind::terminal_for_verify(matched, &reason));
+        (matched, reason)
+    }
+
+    /// One enrollment capture against `existing` session embeddings.
+    /// Returns the feedback kind and, on success, the new embedding.
+    /// Default: unsupported (fail closed with `error`).
+    fn capture_for_enroll(&self, _existing: &[Vec<f32>]) -> (FeedbackKind, Option<Vec<f32>>) {
+        (FeedbackKind::Error, None)
+    }
+
+    /// Persist a finished enrollment and reload in-memory templates.
+    /// Returns the number stored. Default: unsupported.
+    fn finish_enroll_store(&self, _user: &str, _embeddings: &[Vec<f32>]) -> Result<usize, String> {
+        Err("enrollment not supported by this verifier".to_string())
+    }
 }
 
 pub struct Authenticator {
@@ -151,6 +189,16 @@ fn new_request_id() -> Result<String, AuthError> {
         id.push_str(&format!("{b:02x}"));
     }
     Ok(id)
+}
+
+/// Emit one AuthFeedback signal; failures are logged, never fatal
+/// (feedback is advisory — the (matched, reason) result decides).
+async fn emit_feedback(emitter: &SignalEmitter<'_>, request_id: &str, kind: FeedbackKind) {
+    if let Err(e) =
+        Authenticator::auth_feedback(emitter, request_id, kind.as_str(), kind.message()).await
+    {
+        eprintln!("zdrd: AuthFeedback emit failed for {request_id}: {e}");
+    }
 }
 
 #[interface(name = "org.zdr.Authenticator")]
@@ -252,6 +300,7 @@ impl Authenticator {
         request_id: &str,
         #[zbus(header)] header: Header<'_>,
         #[zbus(connection)] conn: &Connection,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> Result<(bool, String), AuthError> {
         require_root(conn, &header).await?;
         // Consume the approved request exactly once, before any capture.
@@ -274,22 +323,38 @@ impl Authenticator {
         // tokio::time panic on the zbus executor thread. A thread that
         // outlives the deadline cannot be killed; it holds the cameras
         // until it returns, and the next attempt then fails closed.
+        // Feedback and the result share one channel so signals are
+        // emitted in order and the terminal kind is never lost behind
+        // the return value.
+        enum WorkerMsg {
+            Feedback(FeedbackKind),
+            Done((bool, String)),
+        }
         let verifier = Arc::clone(&self.verifier);
         let capture_user = user.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel::<WorkerMsg>();
+        let fb_tx = tx.clone();
         let spawned = std::thread::Builder::new()
             .name("zdrd-capture".to_string())
             .spawn(move || {
-                let _ = tx.send(verifier.verify(&capture_user));
+                let feedback = |kind: FeedbackKind| {
+                    let _ = fb_tx.send(WorkerMsg::Feedback(kind));
+                };
+                let result = verifier.verify_with_feedback(&capture_user, &feedback);
+                let _ = tx.send(WorkerMsg::Done(result));
             });
         if let Err(e) = spawned {
             eprintln!("zdrd: CaptureVerify spawn failed for user={user}: {e}");
+            emit_feedback(&emitter, request_id, FeedbackKind::Error).await;
             return Ok((false, "engine".to_string()));
         }
         let deadline = Instant::now() + CAPTURE_TIMEOUT;
         loop {
             match rx.try_recv() {
-                Ok(result) => {
+                Ok(WorkerMsg::Feedback(kind)) => {
+                    emit_feedback(&emitter, request_id, kind).await;
+                }
+                Ok(WorkerMsg::Done(result)) => {
                     eprintln!(
                         "zdrd: CaptureVerify user={user} matched={} reason={}",
                         result.0, result.1
@@ -298,12 +363,14 @@ impl Authenticator {
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     eprintln!("zdrd: CaptureVerify worker stopped for user={user}");
+                    emit_feedback(&emitter, request_id, FeedbackKind::Error).await;
                     return Ok((false, "engine".to_string()));
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
             if Instant::now() >= deadline {
                 eprintln!("zdrd: CaptureVerify timed out for user={user}");
+                emit_feedback(&emitter, request_id, FeedbackKind::Error).await;
                 return Ok((false, "camera".to_string()));
             }
             async_io::Timer::after(Duration::from_millis(25)).await;
@@ -323,6 +390,14 @@ impl Authenticator {
     }
 
     #[zbus(signal)]
+    async fn auth_feedback(
+        signal_emitter: &SignalEmitter<'_>,
+        request_id: &str,
+        kind: &str,
+        message: &str,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
     async fn auth_requested(
         signal_emitter: &SignalEmitter<'_>,
         request_id: &str,
@@ -331,4 +406,36 @@ impl Authenticator {
         tty: &str,
         label: &str,
     ) -> zbus::Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    struct StubVerifier(bool, &'static str);
+    impl Verifier for StubVerifier {
+        fn verify(&self, _user: &str) -> (bool, String) {
+            (self.0, self.1.to_string())
+        }
+    }
+
+    #[test]
+    fn feedback_threaded_through_verify() {
+        for (stub, want_terminal) in [
+            (StubVerifier(true, "match"), FeedbackKind::Matched),
+            (StubVerifier(false, "nomatch"), FeedbackKind::NotMatched),
+            (StubVerifier(false, "noface-ir"), FeedbackKind::NoFace),
+            (StubVerifier(false, "camera"), FeedbackKind::Error),
+        ] {
+            let seen = RefCell::new(Vec::new());
+            let cb = |k: FeedbackKind| seen.borrow_mut().push(k);
+            let result = stub.verify_with_feedback("alice", &cb);
+            assert_eq!(result.0, stub.0);
+            assert_eq!(
+                seen.into_inner(),
+                vec![FeedbackKind::Capturing, want_terminal]
+            );
+        }
+    }
 }
