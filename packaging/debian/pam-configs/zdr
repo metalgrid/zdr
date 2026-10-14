@@ -1,0 +1,10 @@
+Name: Face authentication (zdr, IR consent-gated)
+Default: no
+Priority: 128
+Auth-Type: Primary
+Auth:
+	[success=end default=ignore]	pam_zdr.so
+	[success=1 default=ignore]	pam_localuser.so
+Auth-Initial:
+	[success=end default=ignore]	pam_zdr.so
+	[success=1 default=ignore]	pam_localuser.so
