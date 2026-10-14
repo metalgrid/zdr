@@ -27,9 +27,14 @@
 // the same program showing a plain window.
 
 #include <QGuiApplication>
+#include <QPointer>
 #include <QQmlApplicationEngine>
 #include <QQuickWindow>
 #include <QUrl>
+
+#include <iostream>
+#include <string>
+#include <thread>
 
 #if __has_include(<LayerShellQt/Window.h>)
 #include <LayerShellQt/Window.h>
@@ -64,6 +69,46 @@ int main(int argc, char *argv[])
     engine.load(QUrl::fromLocalFile(qmlPath));
     if (engine.rootObjects().isEmpty())
         return 1;
+
+    // Live feedback: a detached reader thread forwards stdin lines
+    //   status: <message>       -> QML `statusText`
+    //   status-kind: <kind>     -> QML `statusKind` (status tint)
+    // to the root object on the GUI thread. All other lines are
+    // ignored, and EOF (agent gone / stdin closed) just ends the
+    // thread — the countdown and exit-code contract are untouched.
+    // Under qml6 there is no host, so the QML defaults stand.
+    {
+        QPointer<QObject> rootObject(engine.rootObjects().constFirst());
+        std::thread([rootObject]() {
+            std::string raw;
+            while (std::getline(std::cin, raw)) {
+                const QString line = QString::fromUtf8(raw.c_str()).trimmed();
+                QString property;
+                QString value;
+                if (line.startsWith(QStringLiteral("status-kind: "))) {
+                    property = QStringLiteral("statusKind");
+                    value = line.mid(13);
+                } else if (line.startsWith(QStringLiteral("status: "))) {
+                    property = QStringLiteral("statusText");
+                    value = line.mid(8);
+                } else {
+                    continue;
+                }
+                if (!rootObject)
+                    return;
+                QMetaObject::invokeMethod(
+                    rootObject,
+                    [rootObject, property, value]() {
+                        // std::cerr, not qDebug: Qt may have debug
+                        // output routed away in the session.
+                        if (rootObject && rootObject->setProperty(
+                                               property.toUtf8().constData(), value))
+                            std::cerr << "zdr-prompt: status update applied\n";
+                    },
+                    Qt::QueuedConnection);
+            }
+        }).detach();
+    }
 
 #ifdef ZDR_HAS_LAYER_SHELL
     if (auto *window = qobject_cast<QQuickWindow *>(engine.rootObjects().constFirst())) {
