@@ -35,11 +35,11 @@ Window {
     id: root
 
     width: 440
-    height: 300
+    height: 320
     minimumWidth: 440
     maximumWidth: 440
-    minimumHeight: 300
-    maximumHeight: 300
+    minimumHeight: 320
+    maximumHeight: 320
     visible: true
     title: "zdr-prompt"
     color: root.colSurface
@@ -63,6 +63,23 @@ Window {
     property color colHover: "#3daee9"
     property real cornerRadius: 12
     property string fontFamily: "Sans Serif"
+
+    // -- Live feedback status (set by the C++ host from stdin; ----
+    //    under qml6 nothing sets them and the defaults stand) ------
+    // Written via `status: <message>` / `status-kind: <kind>` lines
+    // on the host's stdin (see zdr-agent/README.md). Kind -> colour
+    // mapping is `statusColorForKind` below; it mirrors
+    // `feedback_tone` in zdr-agent/src/lib.rs (unit-tested there).
+    property string statusText: "Look at the camera…"
+    property string statusKind: ""
+
+    function statusColorForKind(kind) {
+        if (kind === "matched")
+            return root.colPrimary;
+        if (kind === "not-matched" || kind === "error" || kind === "no-face")
+            return root.colError;
+        return root.colOnSurfaceVariant;
+    }
 
     // -- Countdown / decision state ---------------------------------
     property real totalSeconds: 30
@@ -315,6 +332,16 @@ Window {
                     elide: Text.ElideRight
                 }
             }
+        }
+
+        Text {
+            Layout.fillWidth: true
+            text: root.statusText
+            color: root.statusColorForKind(root.statusKind)
+            font.family: root.fontFamily
+            font.pixelSize: 13
+            elide: Text.ElideRight
+            horizontalAlignment: Text.AlignHCenter
         }
 
         ColumnLayout {

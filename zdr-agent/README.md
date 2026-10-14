@@ -15,6 +15,7 @@ daemon using this contract:
 | Interface | `org.zdr.Authenticator` |
 | Method | `RegisterAgent() -> ()` |
 | Signal | `AuthRequested(request_id:s, user:s, service:s, tty:s, label:s)` |
+| Signal | `AuthFeedback(request_id:s, kind:s, message:s)` (display only) |
 | Method | `Respond(request_id:s, approved:b) -> ()` |
 
 On start it subscribes to `AuthRequested` and then calls
@@ -28,6 +29,17 @@ consent through the first available prompt backend (below), and
 sends the result back with `Respond(request_id, approved)`. The
 daemon proceeds with the face scan only on approval. Nothing about
 the prompt is a hard Qt dependency: Qt is one optional front-end.
+
+After `RegisterAgent` the agent also subscribes to `AuthFeedback`
+on the same system-bus connection, handled on a dedicated thread
+so it can never block the consent loop. Feedback whose
+`request_id` matches the request whose prompt subprocess is
+currently running is forwarded to that subprocess's stdin (see
+the optional status protocol below); all other feedback — and all
+feedback while the notification backend is showing, which has no
+stdin sink — is logged as one sanitized stderr line. Feedback is
+display only: it never calls daemon methods and never changes
+`Respond` behaviour or the consent flow.
 
 ## Prompt backends
 
@@ -83,6 +95,18 @@ installed as a `zdr-prompt` host):
   self-time-out at 30 s (deny) rather than wait forever.
 - **Never print secrets.** Fields may appear in logs; print
   nothing sensitive to stdout/stderr.
+- **Optional stdin status protocol.** While the executable runs,
+  the agent may write lines to its stdin in the form
+  `status: <message>` (human-readable live feedback from the
+  daemon, e.g. a face-capture hint), each preceded by a companion
+  `status-kind: <kind>` line where `<kind>` is one of `capturing`,
+  `no-face`, `multiple-faces`, `too-dark`, `too-bright`,
+  `duplicate-pose`, `matched`, `not-matched`, `stored`, `error`.
+  Both lines are single-line sanitized text. A front-end may
+  display `status:` lines (optionally tinting by kind) or ignore
+  stdin entirely — ignoring it has no effect on the exit-code
+  contract. The bundled Qt host implements this; the same QML run
+  under bare `qml6` ignores stdin and keeps its default status.
 
 The bundled QtQuick front-end is additionally invoked as
 `zdr-prompt <qml path> <service> <user> <tty> <label>` and under
@@ -104,13 +128,20 @@ The bundled QtQuick front-end is additionally invoked as
 
 ## The QtQuick prompt
 
-`prompt/zdr-prompt.qml` is a self-contained 440×300 QtQuick window
+`prompt/zdr-prompt.qml` is a self-contained 440×320 QtQuick window
 (title `zdr-prompt`) showing "Face authentication requested", the
-service/user/tty lines, the label in quotes when non-empty, a 30 s
-countdown bar, and **Approve and scan** / **Deny** buttons.
+service/user/tty lines, the label in quotes when non-empty, a
+status line under the request details (default
+“Look at the camera…”), a 30 s countdown bar, and
+**Approve and scan** / **Deny** buttons.
 Enter/Return approves, Escape denies, the countdown reaching zero
 denies, and closing the window denies. Exit code 0 approves,
-1 denies — the contract above.
+1 denies — the contract above. The C++ host feeds the status line
+from its stdin (`status: ` / `status-kind: ` lines, above) into
+the QML `statusText`/`statusKind` properties on the GUI thread;
+the status is tinted primary for `matched`, error colour for
+`not-matched`/`error`/`no-face`, and secondary text colour
+otherwise (mirroring `feedback_tone` in `src/lib.rs`).
 
 `prompt/main.cpp` is a minimal optional C++ host for it. If
 layer-shell-qt headers are available at build time
@@ -238,6 +269,9 @@ The agent never approves by default. Concretely:
 - **One popup at a time.** Requests are handled sequentially;
   duplicates of an already-seen `request_id` on the same connection
   are dropped, never re-prompted.
+- **Feedback is display only.** `AuthFeedback` is routed by exact
+  `request_id` match to the running prompt (or logged); unknown or
+  stale feedback can never approve, deny, or extend a prompt.
 - **Daemon/bus down** → the agent logs to stderr and retries
   `RegisterAgent` every 2 s forever; nothing is approved while
   disconnected.
@@ -251,15 +285,19 @@ The agent never approves by default. Concretely:
   exit-code → decision mapping, prompt argument construction
   (including hostile labels), backend selection and mode parsing,
   QML/host path resolution, other-user filtering, duplicate
-  suppression, uid/username resolution.
-- `src/main.rs` — system-bus connection, signal handling, prompt
-  subprocess spawning/probing/waiting, backend chain, reconnect
-  loop, signal-handler setup.
+  suppression, uid/username resolution, feedback routing
+  (active-request match vs log-only), `status: ` line formatting,
+  and the feedback kind → tone mapping.
+- `src/main.rs` — system-bus connection, signal handling
+  (including the separate `AuthFeedback` thread sharing the
+  connection), prompt subprocess spawning/probing/waiting with
+  piped stdin, backend chain, reconnect loop, signal-handler setup.
 - `src/notify.rs` — desktop-notification backend (session bus,
   `org.freedesktop.Notifications`).
 - `prompt/zdr-prompt.qml` — the QtQuick prompt (Noctalia-themed).
 - `prompt/main.cpp`, `prompt/CMakeLists.txt` — optional QtQuick
-  host binary with compile-time-optional layer-shell support.
+  host binary with compile-time-optional layer-shell support and
+  the stdin → QML status bridge.
 
 ## Tests
 
