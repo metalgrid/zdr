@@ -64,15 +64,6 @@ pub trait Verifier: Send + Sync {
     fn verify(&self, user: &str) -> (bool, String);
 }
 
-/// Verifier used until the real engine is wired in; fails closed.
-pub struct UnavailableVerifier;
-
-impl Verifier for UnavailableVerifier {
-    fn verify(&self, _user: &str) -> (bool, String) {
-        (false, "engine".to_string())
-    }
-}
-
 pub struct Authenticator {
     consent: Arc<Mutex<Consent>>,
     verifier: Arc<dyn Verifier>,
@@ -135,11 +126,7 @@ async fn caller(conn: &Connection, header: &Header<'_>) -> Result<Caller, AuthEr
 /// Look up a user's uid in /etc/passwd (service-layer helper; the consent
 /// state machine itself stays free of system databases).
 fn uid_for_user(user: &str) -> Option<u32> {
-    if user.is_empty()
-        || user.contains(['/', '\0', ':'])
-        || user == "."
-        || user == ".."
-    {
+    if user.is_empty() || user.contains(['/', '\0', ':']) || user == "." || user == ".." {
         return None;
     }
     let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
@@ -226,7 +213,10 @@ impl Authenticator {
         let who = caller(conn, &header).await?;
         self.lock_consent()?
             .respond(request_id, approved, &who, Instant::now())?;
-        eprintln!("zdrd: Respond id={request_id} approved={approved} uid={}", who.uid);
+        eprintln!(
+            "zdrd: Respond id={request_id} approved={approved} uid={}",
+            who.uid
+        );
         Ok(())
     }
 
@@ -265,9 +255,7 @@ impl Authenticator {
                 .take_for_verify(request_id, Instant::now())
             {
                 Ok(req) => req.user,
-                Err(ConsentError::NotApproved) => {
-                    return Ok((false, "not-approved".to_string()))
-                }
+                Err(ConsentError::NotApproved) => return Ok((false, "not-approved".to_string())),
                 Err(ConsentError::Expired) | Err(ConsentError::Unknown) => {
                     return Ok((false, "expired".to_string()))
                 }

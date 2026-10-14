@@ -7,3 +7,6 @@ edition = "2021"
 clap = { version = "4.5", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
 zbus = "5"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+ort = "=2.0.0-rc.14"
+v4l = "0.14"

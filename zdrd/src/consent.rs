@@ -239,7 +239,8 @@ impl Consent {
         } else {
             req.state = State::Denied;
             let user = req.user.clone();
-            self.cooldown_until.insert(user.clone(), now + self.cooldown);
+            self.cooldown_until
+                .insert(user.clone(), now + self.cooldown);
             self.pending_by_user.remove(&user);
         }
         Ok(())
@@ -264,7 +265,11 @@ impl Consent {
     /// Current outcome, or `None` while still awaiting a decision.
     /// Denied/expired tombstones are reported until consumed by verify,
     /// cancel, or a sweep; approved requests stay until `take_for_verify`.
-    pub fn outcome(&mut self, request_id: &str, now: Instant) -> Result<Option<Outcome>, ConsentError> {
+    pub fn outcome(
+        &mut self,
+        request_id: &str,
+        now: Instant,
+    ) -> Result<Option<Outcome>, ConsentError> {
         let req = self
             .requests
             .get_mut(request_id)
@@ -440,10 +445,7 @@ mod tests {
             c.outcome("id1", later).expect("outcome"),
             Some(Outcome::Expired)
         );
-        assert_eq!(
-            c.take_for_verify("id1", later),
-            Err(ConsentError::Expired)
-        );
+        assert_eq!(c.take_for_verify("id1", later), Err(ConsentError::Expired));
         assert_eq!(
             c.respond("id1", true, &root(), later),
             Err(ConsentError::NotApproved)
@@ -536,10 +538,7 @@ mod tests {
             .expect("begin");
         c.respond("id1", true, &root(), now).expect("respond");
         assert!(c.take_for_verify("id1", now).is_ok());
-        assert_eq!(
-            c.take_for_verify("id1", now),
-            Err(ConsentError::Unknown)
-        );
+        assert_eq!(c.take_for_verify("id1", now), Err(ConsentError::Unknown));
         assert_eq!(c.outcome("id1", now), Err(ConsentError::Unknown));
     }
 

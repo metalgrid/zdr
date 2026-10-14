@@ -1,11 +1,20 @@
+mod align;
 mod args;
+mod capture;
 mod consent;
+mod engine;
+mod error;
 mod service;
+mod templates;
+mod verify;
+mod yunet;
 
 use args::Args;
 use clap::Parser;
-use service::{Authenticator, UnavailableVerifier};
+use engine::OnnxEngine;
+use service::Authenticator;
 use std::sync::Arc;
+use verify::FaceVerifier;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -18,7 +27,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.threshold
     );
 
-    let svc = Authenticator::new(Arc::new(UnavailableVerifier));
+    // Models stay loaded for the daemon's lifetime. A model load failure
+    // is fatal at startup (fail closed, no half-working daemon).
+    let engine = OnnxEngine::load(&args.yunet, &args.sface)
+        .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+    let verifier = FaceVerifier::new(
+        engine,
+        args.auth_dir.clone(),
+        args.rgb_camera.clone(),
+        args.ir_camera.clone(),
+        args.threshold,
+    );
+    let svc = Authenticator::new(Arc::new(verifier));
     let _conn = zbus::connection::Builder::system()?
         .name("org.zdr.Authenticator")?
         .serve_at("/org/zdr/Authenticator", svc)?
