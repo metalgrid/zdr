@@ -85,7 +85,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.threshold,
         cfg.require_ir,
     );
-    let svc = Authenticator::new(Arc::new(verifier));
+    let svc = Authenticator::with_sealer(
+        Arc::new(verifier),
+        cfg.auth_dir.clone(),
+        Arc::new(seal::PasswordSealer::new(cfg.tpm_pcrs.clone())),
+    );
     let _conn = zbus::connection::Builder::system()?
         .name("org.zdr.Authenticator")?
         .serve_at("/org/zdr/Authenticator", svc)?

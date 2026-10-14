@@ -15,6 +15,12 @@
 //!   (stored)`, `CancelEnroll(enroll_id) -> ()` — root only (Step 11)
 //! - `ServerInfo() -> (version, require_ir)` — read-only, any uid,
 //!   no side effects (Step 14; the only contract addition)
+//! - `EnrollPassword(user, password) -> ()` — root only (Step 15);
+//!   TPM-seals the password to `<auth-dir>/<user>/password.cred`
+//! - `HasSealedPassword(user) -> (has)` — any uid, existence only
+//! - `CaptureVerifyAuthtok(request_id) -> (matched, reason,
+//!   password)` — root only; like `CaptureVerify`, plus the sealed
+//!   password on a match (empty when none is sealed), Step 15
 //! - Signal `AuthRequested(request_id, user, service, tty, label)`
 //! - Signal `AuthFeedback(request_id, kind, message)` — emitted during
 //!   CaptureVerify and enrollment captures; for enrollment the first
@@ -30,7 +36,9 @@
 use crate::consent::{Caller, Consent, ConsentError};
 use crate::enroll::{EnrollError, Enrollments};
 use crate::feedback::FeedbackKind;
+use crate::seal::{PasswordSealer, SecretBytes};
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zbus::message::Header;
@@ -111,14 +119,43 @@ pub struct Authenticator {
     consent: Arc<Mutex<Consent>>,
     enrollments: Arc<Mutex<Enrollments>>,
     verifier: Arc<dyn Verifier>,
+    auth_dir: PathBuf,
+    sealer: Arc<PasswordSealer>,
 }
 
 impl Authenticator {
-    pub fn new(verifier: Arc<dyn Verifier>) -> Self {
+    pub fn with_sealer(
+        verifier: Arc<dyn Verifier>,
+        auth_dir: PathBuf,
+        sealer: Arc<PasswordSealer>,
+    ) -> Self {
         Authenticator {
             consent: Arc::new(Mutex::new(Consent::new())),
             enrollments: Arc::new(Mutex::new(Enrollments::new())),
             verifier,
+            auth_dir,
+            sealer,
+        }
+    }
+
+    /// Consume an approved request exactly once, mapping the
+    /// not-approved / expired / unknown cases onto the contract's
+    /// `(matched, reason)` results shared by both capture methods.
+    /// `Ok(Err(result))` is a contract result, `Err` a bus error.
+    fn take_verify_user(
+        &self,
+        request_id: &str,
+    ) -> Result<std::result::Result<String, (bool, String)>, AuthError> {
+        match self
+            .lock_consent()?
+            .take_for_verify(request_id, Instant::now())
+        {
+            Ok(req) => Ok(Ok(req.user)),
+            Err(ConsentError::NotApproved) => Ok(Err((false, "not-approved".to_string()))),
+            Err(ConsentError::Expired) | Err(ConsentError::Unknown) => {
+                Ok(Err((false, "expired".to_string())))
+            }
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -212,6 +249,53 @@ async fn emit_feedback(emitter: &SignalEmitter<'_>, request_id: &str, kind: Feed
     {
         eprintln!("zdrd: AuthFeedback emit failed for {request_id}: {e}");
     }
+}
+
+/// CaptureVerifyAuthtok core, run on the worker thread: verify once,
+/// and only on a match touch the sealed blob. After a successful
+/// unseal the match is verified a *second* time against the template
+/// store (defence in depth: the released bytes are the user's real
+/// password, so one capture must not be enough to extract them)
+/// before the password leaves the daemon. Every failure path returns
+/// an empty password; the unsealed SecretBytes is dropped (zeroized)
+/// here whenever it is not returned. Logs carry user + request id
+/// only, never contents.
+fn verify_and_release(
+    verifier: &dyn Verifier,
+    user: &str,
+    request_id: &str,
+    sealer: &PasswordSealer,
+    auth_dir: &Path,
+    feedback: &dyn Fn(FeedbackKind),
+) -> (bool, String, Option<SecretBytes>) {
+    let (matched, reason) = verifier.verify_with_feedback(user, feedback);
+    if !matched {
+        return (matched, reason, None);
+    }
+    let path = match crate::seal::password_cred_path(auth_dir, user) {
+        Some(p) if p.is_file() => p,
+        // Matched but nothing sealed: not an error, empty password.
+        _ => return (matched, reason, None),
+    };
+    let secret = match sealer.unseal(&path) {
+        Ok(secret) => secret,
+        Err(e) => {
+            eprintln!("zdrd: CaptureVerifyAuthtok unseal failed user={user} id={request_id}: {e}");
+            return (false, "engine".to_string(), None);
+        }
+    };
+    let (matched2, reason2) = verifier.verify_with_feedback(user, feedback);
+    if !matched2 {
+        eprintln!(
+            "zdrd: CaptureVerifyAuthtok second verify failed user={user} id={request_id} reason={reason2}"
+        );
+        // `secret` drops here and is zeroized, never returned.
+        return (false, reason2, None);
+    }
+    eprintln!(
+        "zdrd: CaptureVerifyAuthtok unseal ok, second verify matched user={user} id={request_id}"
+    );
+    (true, reason2, Some(secret))
 }
 
 #[interface(name = "org.zdr.Authenticator")]
@@ -327,18 +411,9 @@ impl Authenticator {
     ) -> Result<(bool, String), AuthError> {
         require_root(conn, &header).await?;
         // Consume the approved request exactly once, before any capture.
-        let user = {
-            match self
-                .lock_consent()?
-                .take_for_verify(request_id, Instant::now())
-            {
-                Ok(req) => req.user,
-                Err(ConsentError::NotApproved) => return Ok((false, "not-approved".to_string())),
-                Err(ConsentError::Expired) | Err(ConsentError::Unknown) => {
-                    return Ok((false, "expired".to_string()))
-                }
-                Err(e) => return Err(e.into()),
-            }
+        let user = match self.take_verify_user(request_id)? {
+            Ok(user) => user,
+            Err(result) => return Ok(result),
         };
         // Capture + inference is blocking (cameras, ONNX): run it on a
         // plain thread and poll for the result with a hard deadline. No
@@ -395,6 +470,183 @@ impl Authenticator {
                 eprintln!("zdrd: CaptureVerify timed out for user={user}");
                 emit_feedback(&emitter, request_id, FeedbackKind::Error).await;
                 return Ok((false, "camera".to_string()));
+            }
+            async_io::Timer::after(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Step 15: seal `password` for `user` to
+    /// `<auth-dir>/<user>/password.cred`, bound to the TPM. Root
+    /// only, like BeginAuth. The D-Bus layer materializes `password`
+    /// as a String; it is converted into a zeroizing SecretBytes
+    /// immediately and the String's buffer moves with it (into_bytes),
+    /// so no extra daemon-owned copy is made. Never logged.
+    async fn enroll_password(
+        &self,
+        user: &str,
+        password: String,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] conn: &Connection,
+    ) -> Result<(), AuthError> {
+        require_root(conn, &header).await?;
+        if !crate::templates::valid_user(user) || uid_for_user(user).is_none() {
+            return Err(AuthError::InvalidArgs(format!("unknown user {user:?}")));
+        }
+        if password.is_empty() {
+            return Err(AuthError::InvalidArgs("empty password".to_string()));
+        }
+        let secret = SecretBytes::new(password.into_bytes());
+        let path = crate::seal::password_cred_path(&self.auth_dir, user)
+            .ok_or_else(|| AuthError::InvalidArgs(format!("invalid user name {user:?}")))?;
+        // systemd-creds is blocking: run it on a plain thread and poll
+        // with a deadline (no tokio APIs on the zbus executor thread).
+        // The runner itself enforces the 10 s cap; this deadline is a
+        // backstop so the handler can never hang on a stuck child.
+        let sealer = Arc::clone(&self.sealer);
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), crate::seal::SealError>>();
+        let spawned = std::thread::Builder::new()
+            .name("zdrd-seal".to_string())
+            .spawn(move || {
+                let result = sealer.seal(&secret, &path);
+                // `secret` drops (zeroized) when this thread ends.
+                let _ = tx.send(result);
+            });
+        if let Err(e) = spawned {
+            eprintln!("zdrd: EnrollPassword spawn failed for user={user}: {e}");
+            return Err(AuthError::Failed(format!(
+                "sealing password for {user}: spawn failed"
+            )));
+        }
+        let deadline = Instant::now() + crate::seal::SEAL_TIMEOUT + Duration::from_secs(2);
+        loop {
+            match rx.try_recv() {
+                Ok(Ok(())) => {
+                    eprintln!("zdrd: EnrollPassword sealed password for user={user}");
+                    return Ok(());
+                }
+                Ok(Err(e)) => {
+                    eprintln!("zdrd: EnrollPassword seal failed for user={user}: {e}");
+                    return Err(AuthError::Failed(format!(
+                        "sealing password for {user}: {e}"
+                    )));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    eprintln!("zdrd: EnrollPassword worker stopped for user={user}");
+                    return Err(AuthError::Failed(format!(
+                        "sealing password for {user}: worker stopped"
+                    )));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            if Instant::now() >= deadline {
+                eprintln!("zdrd: EnrollPassword timed out for user={user}");
+                return Err(AuthError::Failed(format!(
+                    "sealing password for {user}: timed out"
+                )));
+            }
+            async_io::Timer::after(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Step 15: whether a sealed password exists for `user`. Any uid;
+    /// reveals existence only, never reads the blob.
+    #[zbus(out_args("has"))]
+    async fn has_sealed_password(&self, user: &str) -> bool {
+        crate::seal::has_sealed_password(&self.auth_dir, user)
+    }
+
+    /// Step 15: CaptureVerify plus TPM-sealed password release.
+    /// Consumes the approved request exactly once, like CaptureVerify;
+    /// only after a match is the blob unsealed, and the match is then
+    /// verified a second time inside the daemon (see
+    /// `verify_and_release`) before any password byte is returned.
+    /// The daemon-owned SecretBytes is copied into the D-Bus return
+    /// value and zeroized before this handler returns.
+    #[zbus(out_args("matched", "reason", "password"))]
+    async fn capture_verify_authtok(
+        &self,
+        request_id: &str,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<(bool, String, Vec<u8>), AuthError> {
+        require_root(conn, &header).await?;
+        // Consume the approved request exactly once, before any capture.
+        let user = match self.take_verify_user(request_id)? {
+            Ok(user) => user,
+            Err((matched, reason)) => return Ok((matched, reason, Vec::new())),
+        };
+        // Same worker-thread pattern as CaptureVerify (no tokio APIs
+        // on the zbus executor thread). Unseal runs inside the same
+        // worker after a successful match: the overall budget is the
+        // 15 s capture budget plus the sealer's own 10 s cap.
+        enum WorkerMsg {
+            Feedback(FeedbackKind),
+            Done((bool, String, Option<SecretBytes>)),
+        }
+        let verifier = Arc::clone(&self.verifier);
+        let sealer = Arc::clone(&self.sealer);
+        let auth_dir = self.auth_dir.clone();
+        let capture_user = user.clone();
+        let capture_id = request_id.to_string();
+        let (tx, rx) = std::sync::mpsc::channel::<WorkerMsg>();
+        let fb_tx = tx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("zdrd-capture-authtok".to_string())
+            .spawn(move || {
+                let feedback = |kind: FeedbackKind| {
+                    let _ = fb_tx.send(WorkerMsg::Feedback(kind));
+                };
+                let result = verify_and_release(
+                    verifier.as_ref(),
+                    &capture_user,
+                    &capture_id,
+                    &sealer,
+                    &auth_dir,
+                    &feedback,
+                );
+                let _ = tx.send(WorkerMsg::Done(result));
+            });
+        if let Err(e) = spawned {
+            eprintln!("zdrd: CaptureVerifyAuthtok spawn failed for user={user}: {e}");
+            emit_feedback(&emitter, request_id, FeedbackKind::Error).await;
+            return Ok((false, "engine".to_string(), Vec::new()));
+        }
+        let deadline = Instant::now() + CAPTURE_TIMEOUT + crate::seal::SEAL_TIMEOUT;
+        loop {
+            match rx.try_recv() {
+                Ok(WorkerMsg::Feedback(kind)) => {
+                    emit_feedback(&emitter, request_id, kind).await;
+                }
+                Ok(WorkerMsg::Done((matched, reason, secret))) => {
+                    // Copy into the D-Bus-owned return vector, then
+                    // drop our SecretBytes so the daemon copy is
+                    // zeroized before the return path completes.
+                    let released = secret.is_some();
+                    let password = match secret {
+                        Some(secret) => {
+                            let bytes = secret.as_slice().to_vec();
+                            drop(secret);
+                            bytes
+                        }
+                        None => Vec::new(),
+                    };
+                    eprintln!(
+                        "zdrd: CaptureVerifyAuthtok user={user} id={request_id} matched={matched} reason={reason} password_released={released}"
+                    );
+                    return Ok((matched, reason, password));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    eprintln!("zdrd: CaptureVerifyAuthtok worker stopped for user={user}");
+                    emit_feedback(&emitter, request_id, FeedbackKind::Error).await;
+                    return Ok((false, "engine".to_string(), Vec::new()));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            if Instant::now() >= deadline {
+                eprintln!("zdrd: CaptureVerifyAuthtok timed out for user={user}");
+                emit_feedback(&emitter, request_id, FeedbackKind::Error).await;
+                return Ok((false, "camera".to_string(), Vec::new()));
             }
             async_io::Timer::after(Duration::from_millis(25)).await;
         }
@@ -612,5 +864,175 @@ mod tests {
                 vec![FeedbackKind::Capturing, want_terminal]
             );
         }
+    }
+
+    // ---- Step 15: verify_and_release (fake runner, no TPM) ----
+
+    struct SeqVerifier {
+        results: Mutex<std::collections::VecDeque<(bool, &'static str)>>,
+    }
+    impl SeqVerifier {
+        fn new(results: &[(bool, &'static str)]) -> Self {
+            SeqVerifier {
+                results: Mutex::new(results.iter().copied().collect()),
+            }
+        }
+    }
+    impl Verifier for SeqVerifier {
+        fn verify(&self, _user: &str) -> (bool, String) {
+            match self.results.lock() {
+                Ok(mut q) => q
+                    .pop_front()
+                    .map(|(m, r)| (m, r.to_string()))
+                    .unwrap_or((false, "nomatch".to_string())),
+                Err(_) => (false, "engine".to_string()),
+            }
+        }
+    }
+
+    struct FakeSealRunner {
+        decrypt_calls: Mutex<usize>,
+        stdout: Vec<u8>,
+        success: bool,
+    }
+    impl crate::seal::CommandRunner for FakeSealRunner {
+        fn run(
+            &self,
+            argv: &[String],
+            _stdin: &[u8],
+            _timeout: Duration,
+        ) -> Result<crate::seal::CommandOutput, crate::seal::SealError> {
+            if argv.iter().any(|a| a == "decrypt") {
+                if let Ok(mut n) = self.decrypt_calls.lock() {
+                    *n += 1;
+                }
+            }
+            Ok(crate::seal::CommandOutput {
+                success: self.success,
+                status: Some(if self.success { 0 } else { 1 }),
+                stdout: self.stdout.clone(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    fn release_setup(
+        tag: &str,
+        with_blob: bool,
+        runner: FakeSealRunner,
+    ) -> (PathBuf, PasswordSealer, Arc<FakeSealRunner>) {
+        let dir =
+            std::env::temp_dir().join(format!("zdrd-authtok-test-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        let user_dir = dir.join("alice");
+        std::fs::create_dir_all(&user_dir).expect("user dir");
+        if with_blob {
+            std::fs::write(user_dir.join("password.cred"), b"fake blob").expect("blob");
+        }
+        let runner = Arc::new(runner);
+        let sealer = PasswordSealer::with_runner("7".to_string(), runner.clone());
+        (dir, sealer, runner)
+    }
+
+    fn no_feedback(_: FeedbackKind) {}
+
+    #[test]
+    fn authtok_releases_password_after_second_match() {
+        let (dir, sealer, runner) = release_setup(
+            "release",
+            true,
+            FakeSealRunner {
+                decrypt_calls: Mutex::new(0),
+                stdout: b"the-real-password".to_vec(),
+                success: true,
+            },
+        );
+        let verifier = SeqVerifier::new(&[(true, "match"), (true, "match")]);
+        let (matched, reason, secret) =
+            verify_and_release(&verifier, "alice", "req1", &sealer, &dir, &no_feedback);
+        assert!(matched && reason == "match");
+        let secret = secret.expect("password released");
+        assert_eq!(secret.as_slice(), b"the-real-password");
+        assert_eq!(*runner.decrypt_calls.lock().expect("calls"), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn authtok_no_blob_returns_empty_without_unseal() {
+        let (dir, sealer, runner) = release_setup(
+            "noblob",
+            false,
+            FakeSealRunner {
+                decrypt_calls: Mutex::new(0),
+                stdout: b"unused".to_vec(),
+                success: true,
+            },
+        );
+        let verifier = SeqVerifier::new(&[(true, "match")]);
+        let (matched, reason, secret) =
+            verify_and_release(&verifier, "alice", "req1", &sealer, &dir, &no_feedback);
+        assert!(matched && reason == "match");
+        assert!(secret.is_none());
+        assert_eq!(*runner.decrypt_calls.lock().expect("calls"), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn authtok_no_unseal_attempt_when_not_matched() {
+        let (dir, sealer, runner) = release_setup(
+            "nomatch",
+            true,
+            FakeSealRunner {
+                decrypt_calls: Mutex::new(0),
+                stdout: b"unused".to_vec(),
+                success: true,
+            },
+        );
+        let verifier = SeqVerifier::new(&[(false, "nomatch")]);
+        let (matched, reason, secret) =
+            verify_and_release(&verifier, "alice", "req1", &sealer, &dir, &no_feedback);
+        assert!(!matched && reason == "nomatch");
+        assert!(secret.is_none());
+        assert_eq!(*runner.decrypt_calls.lock().expect("calls"), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn authtok_second_verify_failure_withholds_password() {
+        let (dir, sealer, runner) = release_setup(
+            "secondfail",
+            true,
+            FakeSealRunner {
+                decrypt_calls: Mutex::new(0),
+                stdout: b"the-real-password".to_vec(),
+                success: true,
+            },
+        );
+        let verifier = SeqVerifier::new(&[(true, "match"), (false, "nomatch")]);
+        let (matched, reason, secret) =
+            verify_and_release(&verifier, "alice", "req1", &sealer, &dir, &no_feedback);
+        assert!(!matched && reason == "nomatch");
+        assert!(secret.is_none(), "password must be withheld and dropped");
+        assert_eq!(*runner.decrypt_calls.lock().expect("calls"), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn authtok_unseal_failure_is_engine_and_empty() {
+        let (dir, sealer, _runner) = release_setup(
+            "unsealfail",
+            true,
+            FakeSealRunner {
+                decrypt_calls: Mutex::new(0),
+                stdout: Vec::new(),
+                success: false,
+            },
+        );
+        let verifier = SeqVerifier::new(&[(true, "match")]);
+        let (matched, reason, secret) =
+            verify_and_release(&verifier, "alice", "req1", &sealer, &dir, &no_feedback);
+        assert!(!matched && reason == "engine");
+        assert!(secret.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

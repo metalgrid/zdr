@@ -152,6 +152,9 @@ pub struct CommandOutput {
     pub success: bool,
     pub status: Option<i32>,
     pub stdout: Vec<u8>,
+    /// Captured so the child cannot block on a full pipe; its
+    /// contents are deliberately never read into errors or logs.
+    #[allow(dead_code)]
     pub stderr: Vec<u8>,
 }
 
@@ -324,10 +327,6 @@ impl PasswordSealer {
     /// Sealer over an injected runner (unit tests, fakes).
     pub fn with_runner(pcrs: String, runner: Arc<dyn CommandRunner>) -> Self {
         PasswordSealer { pcrs, runner }
-    }
-
-    pub fn pcrs(&self) -> &str {
-        &self.pcrs
     }
 
     /// Seal `password` to `out_path`. Writes to a unique temporary
