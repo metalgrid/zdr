@@ -84,6 +84,24 @@ but not by a huge margin; ONNX Runtime dominates it.
 - YuNet decoding, alignment (similarity transform + bilinear warp), and
   cosine scoring are unit-tested against OpenCV's documented math.
 
+## Owner live results (2026-10-14, recorded by the team lead)
+
+Three verify-live runs against six enrolled templates (3 RGB + 3 IR).
+SFace reference threshold: 0.363.
+
+Run 1 — owner, live:
+- IR vs IR templates: 0.9570 / 0.9678 / 0.9588. RGB vs RGB: 0.8385-0.9463.
+- Cross-modal scores also pass (IR vs RGB 0.66-0.77), but the design uses IR vs IR.
+
+Runs 2 and 3 — printed-photo and phone-photo attacks (order not labelled):
+- IR: no face detected in either run. The IR gate rejects both at detection.
+- RGB alone would have passed both attacks (best 0.7188 and 0.8512).
+  This confirms RGB-only auth is unsafe and the IR requirement is load-bearing.
+
+Gate verdict: PASS. YuNet+SFace with IR-primary matching is the engine.
+Live IR margin: minimum 0.957 against a 0.363 threshold.
+Open items stay open: dark-room emitter test, second-person separation.
+
 ## What remains unproven (needs the owner — see README.md protocol)
 
 1. **Detection on a real face**: box/landmark accuracy on RGB and IR.
