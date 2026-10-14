@@ -2232,6 +2232,7 @@ dependencies = [
  "async-io",
  "clap",
  "image",
+ "libc",
  "ort",
  "serde",
  "tokio",

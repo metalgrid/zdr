@@ -71,6 +71,9 @@ impl SecretBytes {
         SecretBytes(bytes)
     }
 
+    /// Copy from a slice (tests and small callers); prefer `new`
+    /// to move an existing buffer without copying.
+    #[allow(dead_code)]
     pub fn from_slice(bytes: &[u8]) -> Self {
         SecretBytes(bytes.to_vec())
     }
@@ -79,6 +82,7 @@ impl SecretBytes {
         &self.0
     }
 
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.0.len()
     }
@@ -325,6 +329,7 @@ impl PasswordSealer {
     }
 
     /// Sealer over an injected runner (unit tests, fakes).
+    #[allow(dead_code)]
     pub fn with_runner(pcrs: String, runner: Arc<dyn CommandRunner>) -> Self {
         PasswordSealer { pcrs, runner }
     }

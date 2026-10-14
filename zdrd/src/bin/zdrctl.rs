@@ -33,6 +33,7 @@ fn run() -> i32 {
     };
     let result = match cmd {
         "enroll" => cmd_enroll(rest),
+        "enroll-password" => cmd_enroll_password(rest),
         "list" => cmd_list(rest),
         "remove" => cmd_remove(rest),
         "test" => cmd_test(rest),
@@ -58,8 +59,9 @@ fn run() -> i32 {
 fn print_usage() {
     eprintln!(
         "usage:\n  zdrctl enroll [user]          guided 5-capture enrollment (run with sudo)\n  \
-         zdrctl list [--auth-dir DIR]  per-user template counts\n  \
-         zdrctl remove <user> [--auth-dir DIR]\n  \
+         zdrctl enroll-password [--user <name>]  seal a login password to the TPM (run with sudo)\n  \
+         zdrctl list [--auth-dir DIR]  per-user template counts and sealed-password presence\n  \
+         zdrctl remove <user> [--auth-dir DIR]   removes templates and any sealed password\n  \
          zdrctl test <user>            how to test an enrollment"
     );
 }
@@ -139,6 +141,163 @@ fn proxy() -> Result<zbus::blocking::Proxy<'static>, String> {
         "org.zdr.Authenticator",
     )
     .map_err(|e| format!("creating daemon proxy: {e}"))
+}
+
+/// Best-effort overwrite of a password String we own (the D-Bus
+/// serialization copy is zbus-owned and out of our reach).
+fn zero_string(s: &mut String) {
+    // SAFETY: writing zero bytes keeps the String valid UTF-8 (NUL
+    // is valid), and the length is unchanged until clear() below.
+    unsafe {
+        for b in s.as_mut_vec().iter_mut() {
+            std::ptr::write_volatile(b, 0);
+        }
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    s.clear();
+}
+
+struct EchoRestore {
+    fd: std::os::unix::io::RawFd,
+    original: libc::termios,
+}
+
+impl Drop for EchoRestore {
+    fn drop(&mut self) {
+        // SAFETY: fd is the still-open /dev/tty fd and original was
+        // filled by tcgetattr on it.
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
+        }
+    }
+}
+
+/// Read one line from /dev/tty with terminal echo disabled. The
+/// password is never read from argv/stdin and never echoed.
+fn read_password_no_echo(prompt: &str) -> Result<String, String> {
+    use std::io::BufRead;
+    use std::os::unix::io::AsRawFd;
+
+    let mut tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .map_err(|e| format!("opening /dev/tty: {e} (run this from a terminal)"))?;
+    let fd = tty.as_raw_fd();
+    // SAFETY: termios is a plain C struct; zeroed is a valid start
+    // for tcgetattr to fill.
+    let mut original: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
+        return Err(format!(
+            "tcgetattr on /dev/tty: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut no_echo = original;
+    no_echo.c_lflag &= !libc::ECHO;
+    let guard = EchoRestore { fd, original };
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &no_echo) } != 0 {
+        return Err(format!(
+            "disabling terminal echo: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    tty.write_all(prompt.as_bytes())
+        .and_then(|()| tty.flush())
+        .map_err(|e| format!("writing prompt to /dev/tty: {e}"))?;
+    let mut line = String::new();
+    let read_result = std::io::BufReader::new(&tty).read_line(&mut line);
+    drop(guard); // echo restored even if the read failed
+    let _ = tty.write_all(b"\n");
+    let n = read_result.map_err(|e| format!("reading password from /dev/tty: {e}"))?;
+    if n == 0 {
+        return Err("no password read from terminal (EOF)".to_string());
+    }
+    if line.ends_with('\n') {
+        line.pop();
+        if line.ends_with('\r') {
+            line.pop();
+        }
+    }
+    Ok(line)
+}
+
+/// Parse `enroll-password [--user <name>]` (a positional name is
+/// also accepted, matching `enroll`).
+fn parse_enroll_password_user(args: &[String]) -> Result<Option<String>, String> {
+    let mut user: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--user" {
+            let value = args
+                .get(i + 1)
+                .ok_or_else(|| "--user needs a name argument".to_string())?;
+            user = Some(value.clone());
+            i += 2;
+        } else if let Some(value) = arg.strip_prefix("--user=") {
+            user = Some(value.to_string());
+            i += 1;
+        } else if arg.starts_with("--") {
+            return Err(format!("unknown option {arg:?} for enroll-password"));
+        } else {
+            user = Some(arg.clone());
+            i += 1;
+        }
+    }
+    Ok(user)
+}
+
+fn cmd_enroll_password(args: &[String]) -> Result<(), String> {
+    if effective_uid() != Some(0) {
+        return Err(
+            "enroll-password must run as root — run with sudo: sudo zdrctl enroll-password [--user <name>]"
+                .to_string(),
+        );
+    }
+    let user = match parse_enroll_password_user(args)? {
+        Some(u) => u,
+        None => match std::env::var("SUDO_USER") {
+            Ok(u) if valid_user(&u) && u != "root" => u,
+            _ => {
+                return Err(
+                    "no user given and $SUDO_USER is not set; usage: sudo zdrctl enroll-password --user <name>"
+                        .to_string(),
+                )
+            }
+        },
+    };
+    if !valid_user(&user) {
+        return Err(format!("invalid user name {user:?}"));
+    }
+    let mut password = read_password_no_echo(&format!("New sealed password for {user}: "))?;
+    let result = (|| -> Result<(), String> {
+        let mut again = read_password_no_echo("Repeat the password: ")?;
+        let matches = password == again;
+        zero_string(&mut again);
+        if password.is_empty() {
+            return Err("empty passwords are not accepted".to_string());
+        }
+        if !matches {
+            return Err("passwords do not match".to_string());
+        }
+        let proxy = proxy()?;
+        let _: () = proxy
+            .call("EnrollPassword", &(user.as_str(), password.as_str()))
+            .map_err(|e| format!("EnrollPassword({user}): {e}"))?;
+        let has: bool = proxy
+            .call("HasSealedPassword", &(user.as_str(),))
+            .map_err(|e| format!("HasSealedPassword({user}): {e}"))?;
+        if !has {
+            return Err(format!(
+                "daemon reports no sealed password for {user} after enrollment"
+            ));
+        }
+        println!("Sealed password enrolled for {user} (TPM-bound).");
+        Ok(())
+    })();
+    zero_string(&mut password);
+    result
 }
 
 fn cmd_enroll(args: &[String]) -> Result<(), String> {
@@ -296,12 +455,21 @@ fn cmd_list(args: &[String]) -> Result<(), String> {
             None => dir.display().to_string(),
         };
         let bin = dir.join("templates.bin");
+        let sealed = if dir.join("password.cred").is_file() {
+            "yes"
+        } else {
+            "no"
+        };
         match std::fs::read(&bin) {
             Ok(bytes) => match count_templates(&bytes) {
-                Ok(n) => println!("{name}: {n} template(s)"),
-                Err(e) => println!("{name}: corrupt templates.bin ({e})"),
+                Ok(n) => println!("{name}: {n} template(s), sealed password: {sealed}"),
+                Err(e) => {
+                    println!("{name}: corrupt templates.bin ({e}), sealed password: {sealed}")
+                }
             },
-            Err(_) => println!("{name}: 0 template(s) (no templates.bin)"),
+            Err(_) => {
+                println!("{name}: 0 template(s) (no templates.bin), sealed password: {sealed}")
+            }
         }
     }
     Ok(())
@@ -322,7 +490,9 @@ fn cmd_remove(args: &[String]) -> Result<(), String> {
             dir.display()
         ));
     }
-    print!("Remove all face templates for '{user}'? [y/N] ");
+    print!(
+        "Remove all face templates and any sealed password (password.cred) for '{user}'? [y/N] "
+    );
     std::io::stdout()
         .flush()
         .map_err(|e| format!("flushing stdout: {e}"))?;
@@ -336,6 +506,11 @@ fn cmd_remove(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
     let mut removed = 0usize;
+    let cred = dir.join("password.cred");
+    if cred.is_file() {
+        std::fs::remove_file(&cred).map_err(|e| format!("removing {}: {e}", cred.display()))?;
+        removed += 1;
+    }
     let bin = dir.join("templates.bin");
     if bin.is_file() {
         std::fs::remove_file(&bin).map_err(|e| format!("removing {}: {e}", bin.display()))?;
@@ -356,7 +531,7 @@ fn cmd_remove(args: &[String]) -> Result<(), String> {
             removed += 1;
         }
     }
-    println!("Removed {removed} template file(s) for {user}.");
+    println!("Removed {removed} template/sealed-password file(s) for {user}.");
     Ok(())
 }
 
