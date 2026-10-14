@@ -117,8 +117,8 @@ pub fn gray_to_rgb(img: &GrayImage) -> RgbImage {
 }
 
 pub fn load_image_rgb(path: &Path) -> Result<RgbImage> {
-    let img = image::ImageReader::open(path)
-        .map_err(|e| crate::error::io_at(path, e))?
-        .decode()?;
+    // Sniff the real format from the bytes, not the file extension.
+    let bytes = std::fs::read(path).map_err(|e| crate::error::io_at(path, e))?;
+    let img = image::load_from_memory(&bytes)?;
     Ok(img.to_rgb8())
 }
