@@ -52,6 +52,7 @@ package() {
     cd "$srcdir/$pkgname"
     install -Dm755 target/release/zdrd "$pkgdir/usr/bin/zdrd"
     install -Dm755 target/release/zdr-agent "$pkgdir/usr/bin/zdr-agent"
+    install -Dm755 target/release/zdrctl "$pkgdir/usr/bin/zdrctl"
     install -Dm755 target/release/libpam_zdr.so "$pkgdir/usr/lib/security/pam_zdr.so"
     install -Dm755 zdr-prompt "$pkgdir/usr/lib/zdr/zdr-prompt"
     install -Dm644 zdr-agent/prompt/zdr-prompt.qml \
