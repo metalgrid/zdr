@@ -9,8 +9,9 @@ arch=('x86_64')
 url="https://github.com/metalgrid/zdr"
 license=('MIT')
 depends=('pam' 'dbus' 'gcc-libs' 'glibc')
-makedepends=('cargo' 'rust' 'git')
-optdepends=('zenity: GUI consent popup for zdr-agent'
+makedepends=('cargo' 'rust' 'git' 'qt6-declarative')
+optdepends=('qt6-declarative: QtQuick consent prompt'
+            'layer-shell-qt: overlay layer for the QtQuick prompt'
             'v4l-utils: camera inspection'
             'pamtester: test the PAM stack before enabling it')
 install=zdr.install
@@ -26,6 +27,20 @@ build() {
     # The ort crate downloads a prebuilt ONNX Runtime on first build,
     # so this step needs network access.
     cargo build --release --locked --workspace
+
+    # Optional zdr-prompt QtQuick host (plain window). main.cpp uses
+    # LayerShellQt automatically via __has_include when its headers
+    # are present at build time; link it only in that case. This is
+    # deliberately not a hard dependency: without Qt at runtime the
+    # host simply fails its --probe and zdr-agent falls back to
+    # qml6 / desktop notifications.
+    local layershell_libs=''
+    if test -f /usr/include/LayerShellQt/Window.h; then
+        layershell_libs='-lLayerShellQtInterface'
+    fi
+    g++ -std=c++17 -fPIC -O2 zdr-agent/prompt/main.cpp -o zdr-prompt \
+        $(pkg-config --cflags --libs Qt6Quick Qt6Gui Qt6Qml Qt6Core) \
+        $layershell_libs
 }
 
 check() {
@@ -38,6 +53,9 @@ package() {
     install -Dm755 target/release/zdrd "$pkgdir/usr/bin/zdrd"
     install -Dm755 target/release/zdr-agent "$pkgdir/usr/bin/zdr-agent"
     install -Dm755 target/release/libpam_zdr.so "$pkgdir/usr/lib/security/pam_zdr.so"
+    install -Dm755 zdr-prompt "$pkgdir/usr/lib/zdr/zdr-prompt"
+    install -Dm644 zdr-agent/prompt/zdr-prompt.qml \
+        "$pkgdir/usr/share/zdr/zdr-prompt.qml"
 
     install -Dm644 "$srcdir/face_detection_yunet_2023mar.onnx" \
         "$pkgdir/usr/share/zdr/models/face_detection_yunet_2023mar.onnx"
