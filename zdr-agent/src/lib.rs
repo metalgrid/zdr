@@ -280,6 +280,82 @@ impl SeenRequests {
     }
 }
 
+/// Feedback kinds the daemon may emit in `AuthFeedback`
+/// (frozen contract; display only).
+pub const FEEDBACK_KINDS: [&str; 10] = [
+    "capturing",
+    "no-face",
+    "multiple-faces",
+    "too-dark",
+    "too-bright",
+    "duplicate-pose",
+    "matched",
+    "not-matched",
+    "stored",
+    "error",
+];
+
+/// Whether `kind` is in the frozen `AuthFeedback` kind set.
+pub fn is_known_feedback_kind(kind: &str) -> bool {
+    FEEDBACK_KINDS.contains(&kind)
+}
+
+/// Where one `AuthFeedback` signal should go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedbackRoute {
+    /// Forward to the running prompt for the active request.
+    ForwardToPrompt,
+    /// No matching active prompt: log one line only.
+    LogOnly,
+}
+
+/// Pure routing decision: forward only when there is an active
+/// prompt request and the feedback's request ID matches it exactly.
+pub fn route_feedback(active_request_id: Option<&str>, feedback_request_id: &str) -> FeedbackRoute {
+    match active_request_id {
+        Some(id) if !id.is_empty() && id == feedback_request_id => FeedbackRoute::ForwardToPrompt,
+        _ => FeedbackRoute::LogOnly,
+    }
+}
+
+/// Display tone for a feedback kind (QML maps these to colours:
+/// primary / error / secondary respectively; see zdr-prompt.qml).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedbackTone {
+    Primary,
+    Error,
+    Secondary,
+}
+
+/// Kind → tone: `matched` is primary, `not-matched`/`error`/
+/// `no-face` are error, everything else (including unknown) secondary.
+pub fn feedback_tone(kind: &str) -> FeedbackTone {
+    match kind {
+        "matched" => FeedbackTone::Primary,
+        "not-matched" | "error" | "no-face" => FeedbackTone::Error,
+        _ => FeedbackTone::Secondary,
+    }
+}
+
+/// The stdin status line for a prompt front-end:
+/// `status: <message>` with the message sanitized to one line.
+pub fn status_line(message: &str) -> String {
+    format!("status: {}", sanitize_display_text(message))
+}
+
+/// Companion stdin line carrying the feedback kind, so a front-end
+/// can tint the status (`matched`/`not-matched`/...). Front-ends
+/// that only implement `status: ` may ignore it.
+pub fn status_kind_line(kind: &str) -> String {
+    format!("status-kind: {}", sanitize_display_text(kind))
+}
+
+/// Both stdin lines for one feedback event, in send order
+/// (kind first, so the text arrives already tinted).
+pub fn status_lines(kind: &str, message: &str) -> [String; 2] {
+    [status_kind_line(kind), status_line(message)]
+}
+
 /// Our own uid, from `getuid(2)` — not from the environment.
 pub fn own_uid() -> u32 {
     // SAFETY: getuid always succeeds and has no preconditions.
@@ -492,6 +568,49 @@ mod tests {
         assert!(!seen.mark_seen("req-1"));
         assert!(seen.mark_seen("req-2"));
         assert!(!seen.mark_seen("req-1"));
+    }
+
+    #[test]
+    fn feedback_routes_only_to_matching_active_request() {
+        use FeedbackRoute::*;
+        assert_eq!(route_feedback(Some("req-1"), "req-1"), ForwardToPrompt);
+        assert_eq!(route_feedback(Some("req-1"), "req-2"), LogOnly);
+        assert_eq!(route_feedback(None, "req-1"), LogOnly);
+        assert_eq!(route_feedback(Some(""), ""), LogOnly);
+        // No prefix/case-insensitive matching.
+        assert_eq!(route_feedback(Some("req-1"), "Req-1"), LogOnly);
+    }
+
+    #[test]
+    fn status_lines_are_single_line_and_prefixed() {
+        assert_eq!(status_line("Look at the camera"), "status: Look at the camera");
+        // Hostile/newline-bearing messages cannot forge extra protocol lines.
+        assert_eq!(status_line("ok\nstatus: forged\r"), "status: okstatus: forged");
+        assert_eq!(status_kind_line("matched"), "status-kind: matched");
+        assert_eq!(
+            status_lines("no-face", "No face detected"),
+            ["status-kind: no-face".to_string(), "status: No face detected".to_string()]
+        );
+    }
+
+    #[test]
+    fn feedback_tone_mapping() {
+        use FeedbackTone::*;
+        assert_eq!(feedback_tone("matched"), Primary);
+        for kind in ["not-matched", "error", "no-face"] {
+            assert_eq!(feedback_tone(kind), Error, "{kind}");
+        }
+        for kind in ["capturing", "multiple-faces", "too-dark", "too-bright", "duplicate-pose", "stored", "bogus", ""] {
+            assert_eq!(feedback_tone(kind), Secondary, "{kind}");
+        }
+    }
+
+    #[test]
+    fn feedback_kinds_are_the_frozen_set() {
+        for kind in ["capturing", "no-face", "multiple-faces", "too-dark", "too-bright", "duplicate-pose", "matched", "not-matched", "stored", "error"] {
+            assert!(is_known_feedback_kind(kind), "{kind}");
+        }
+        assert!(!is_known_feedback_kind("unknown"));
     }
 
     #[test]
