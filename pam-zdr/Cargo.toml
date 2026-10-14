@@ -11,5 +11,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pam-bindings = "0.1.1"
-rand = "0.8.5"
 zbus = { version = "4.1.1", features = ["blocking"] }
