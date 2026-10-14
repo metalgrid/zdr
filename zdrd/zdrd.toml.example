@@ -20,6 +20,14 @@
 # Directory holding per-user templates: <auth_dir>/<user>/templates.bin
 #auth_dir = "/var/lib/zdr"
 
+# TPM PCRs the sealed login password (Step 15, password.cred) is bound
+# to, as a "+"-separated list such as "7" or "7+11". Default is "7"
+# (Secure Boot state). Set to "" for no PCR binding: the daemon then
+# omits --tpm2-pcrs entirely (systemd-creds 262 accepts an empty
+# --tpm2-pcrs= value when encrypting, but the resulting credential
+# cannot be decrypted again, so an empty value is never passed).
+#tpm_pcrs = "7"
+
 # Path to the YuNet face-detection ONNX model.
 #yunet = "/usr/share/zdr/models/face_detection_yunet_2023mar.onnx"
 

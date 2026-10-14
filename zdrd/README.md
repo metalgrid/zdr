@@ -18,7 +18,8 @@ Precedence: CLI flag > config file > built-in default. Keys:
 `rgb_camera`, `ir_camera` (device path or `"auto"`), `require_ir`
 (bool, default `true`), `threshold` (default 0.363), `auth_dir`
 (default `/var/lib/zdr`), `yunet`, `sface` (default
-`/usr/share/zdr/models/*.onnx`). With no camera configured, the
+`/usr/share/zdr/models/*.onnx`), `tpm_pcrs` (default `"7"`, see
+AUTHTOK below). With no camera configured, the
 daemon auto-detects by V4L2 format scan: a device offering `GREY`
 and no `MJPG` is the IR candidate, a device offering `MJPG` is the
 RGB candidate, lowest by-path name wins, and the probed devices are
@@ -27,6 +28,59 @@ below); verify refuses cross-mode matching with reason `nomatch`.
 `ServerInfo() -> (version, require_ir)` on the D-Bus interface is a
 read-only method any uid may call; it is how `zdrctl` learns the
 mode above.
+
+## AUTHTOK: TPM-sealed password release (Step 15)
+
+What is sealed: the user's *actual login password*, sealed by
+`systemd-creds` (the TPM boundary — zdrd links no TSS library) with
+`--name=zdr-password --with-key=tpm2` to
+`<auth-dir>/<user>/password.cred` (mode 0600, user dir 0700). The
+password is fed to the child on stdin only: never in argv, the
+environment, or any log line. Daemon-owned copies live in a zeroizing
+buffer (`seal::SecretBytes`); that covers zdrd-owned buffers, not
+allocator history or the copies zbus/DBus necessarily materialize.
+
+TPM binding: by default the blob is bound to PCR 7 (Secure Boot
+state) via `tpm_pcrs = "7"` in `zdrd.toml`. A non-empty value is a
+`+`-separated PCR list (`"7+11"`). `tpm_pcrs = ""` means no PCR
+binding: the `--tpm2-pcrs` flag is then *omitted*, because
+systemd-creds 262 accepts an empty `--tpm2-pcrs=` at encrypt time
+but the credential it produces cannot be decrypted again. With no
+PCR binding the blob still only unseals on this machine's TPM, but
+no longer notices Secure Boot state changes. Changing PCRs (or a
+firmware/Secure Boot change that alters PCR 7) makes old blobs
+unsealable: re-run `zdrctl enroll-password`.
+
+Who may release: only a root caller of
+`CaptureVerifyAuthtok(request_id) -> (matched, reason, password)`,
+i.e. the root PAM module, and only bound to a fresh consent request
+that was approved and is consumed exactly once, exactly like
+`CaptureVerify` (reason strings are identical). The flow is:
+consume request → face verify → only on a match, unseal (10 s cap,
+inside the same worker thread, under the 15 s capture budget plus
+that cap) → verify the face a *second* time against the template
+store → only then return the password bytes, zeroizing the daemon
+copy before returning. No match means no unseal attempt is ever
+made. A match with no sealed blob returns `password` empty (not an
+error). `EnrollPassword(user, password)` is root-only;
+`HasSealedPassword(user) -> has` may be called by any uid and
+reveals existence only.
+
+Password changes: the blob is a snapshot. If the user changes their
+login password, the sealed copy goes stale — face auth still
+matches, the released old password is handed to `pam_unix`, which
+fails it, and PAM falls back to the normal password prompt. Fix by
+re-running `sudo zdrctl enroll-password` after a password change.
+
+The honest limit (locked decision): a face match now *equals* the
+password everywhere this release is wired in. Anyone who can pass
+the face check (or defeat it — see the RGB-only warning above) gets
+the real password released to PAM and with it everything the
+password unlocks. That is the design's intent (single sign-on from
+the face), not an implementation bug; enrolling a sealed password
+is what opts a user into it. `sudo zdrctl remove <user>` deletes
+`password.cred` along with the templates, and `zdrctl list` shows
+`sealed password: yes/no` per user.
 
 ## Feedback signal
 
@@ -77,10 +131,16 @@ feature of the already-used zbus 5, so no dependency changes).
 - `sudo zdrctl enroll [user]` — user defaults to `$SUDO_USER`;
   staged pose prompts, Enter per capture, guidance per returned
   kind, finishes with `FinishEnroll`.
+- `sudo zdrctl enroll-password [--user <name>]` — reads the login
+  password twice from `/dev/tty` with echo disabled, rejects empty
+  or mismatched entries, seals it via `EnrollPassword`, and verifies
+  with `HasSealedPassword`.
 - `zdrctl list [--auth-dir DIR]` — per-user counts read locally
-  from `templates.bin` (default auth dir `/var/lib/zdr`).
-- `zdrctl remove <user> [--auth-dir DIR]` — y/N confirm, then
-  deletes `templates.bin` and the `ir*.png` templates.
+  from `templates.bin` (default auth dir `/var/lib/zdr`), plus
+  `sealed password: yes/no` per user by `password.cred` existence.
+- `zdrctl remove <user> [--auth-dir DIR]` — y/N confirm (the prompt
+  notes the sealed password goes too), then deletes
+  `templates.bin`, the `ir*.png` templates, and `password.cred`.
 - `zdrctl test <user>` — prints pamtester guidance only; live
   verify is a PAM operation, there is no daemon shortcut.
 
