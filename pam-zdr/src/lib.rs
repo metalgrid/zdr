@@ -6,9 +6,8 @@ use std::time::Duration;
 
 use pam::constants::{PamFlag, PamResultCode, PAM_PROMPT_ECHO_ON, PAM_TEXT_INFO};
 use pam::conv::Conv;
-use pam::items::{RHost, Service, Tty};
+use pam::items::{RHost, Service, Tty, User};
 use pam::module::{PamHandle, PamHooks};
-use pam::pam_try;
 use zbus::blocking::Connection;
 
 /// D-Bus wait bounds. `zbus` 4.1.1 (blocking) has no per-call reply timeout —
@@ -46,7 +45,17 @@ pam::pam_hooks!(PamZdr);
 impl PamHooks for PamZdr {
     // This function performs the task of authenticating the user.
     fn sm_authenticate(pamh: &mut PamHandle, _args: Vec<&CStr>, _flags: PamFlag) -> PamResultCode {
-        let user = pam_try!(pamh.get_user(None));
+        // Do NOT use PamHandle::get_user from pam-bindings 0.1.1: it passes
+        // an immutable local's address to pam_get_user, which is UB. In
+        // release builds the optimizer folds the null check, get_user then
+        // returns Err(PAM_SUCCESS), and pam_try! turned that into instant
+        // PAM_SUCCESS with no authentication at all. get_item uses a
+        // correctly mutable pointer.
+        let user = match pamh.get_item::<User>() {
+            Ok(Some(user)) => user.0.to_string_lossy().into_owned(),
+            Ok(None) => return fail("reading PAM_USER", "item not set"),
+            Err(code) => return fail("reading PAM_USER", &format!("{code:?}")),
+        };
 
         // Remote sessions never trigger face auth (acceptance test 12): if
         // PAM_RHOST is set and non-empty, fail at once, printing nothing, so
