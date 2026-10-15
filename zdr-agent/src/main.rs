@@ -528,10 +528,17 @@ fn run_session(own_username: &str) -> zbus::Result<()> {
         // our unique name/uid at RegisterAgent and rejects Respond
         // from any other connection.
         if let Err(e) = proxy.respond(request_id, approved) {
-            eprintln!("zdr-agent: Respond({request_id}, {approved}) failed: {e}");
-            return Err(e);
+            // Not session-fatal: the usual cause is the daemon having
+            // already expired the request (our prompt timeout is 35 s,
+            // the daemon TTL is 30 s). Tearing the session down here
+            // only churns registrations; a real disconnect still ends
+            // the signal iterator below and triggers the reconnect.
+            eprintln!(
+                "zdr-agent: Respond({request_id}, {approved}) failed (request likely expired at the daemon): {e}; continuing"
+            );
+        } else {
+            eprintln!("zdr-agent: responded to {request_id}: approved={approved}");
         }
-        eprintln!("zdr-agent: responded to {request_id}: approved={approved}");
     }
 
     if shutdown_requested() {
