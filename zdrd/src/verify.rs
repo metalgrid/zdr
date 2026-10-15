@@ -6,7 +6,7 @@ use crate::capture::{self, gray_to_rgb};
 use crate::engine::{FaceEngine, OnnxEngine};
 use crate::error::DaemonError;
 use crate::feedback::FeedbackKind;
-use crate::service::Verifier;
+use crate::service::{ScoredVerify, Verifier};
 use crate::templates::TemplateStore;
 use image::{GrayImage, RgbImage};
 use std::path::PathBuf;
@@ -153,9 +153,42 @@ impl Verifier for FaceVerifier {
     }
 
     fn verify(&self, user: &str) -> (bool, String) {
+        let scored = self.verify_scored(user);
+        (scored.matched, scored.reason)
+    }
+
+    fn recheck_embedding(&self, user: &str, embedding: &[f32]) -> Option<bool> {
+        // No capture: reload this user's templates and re-score the
+        // already-computed embedding against the current store.
         let mut guard = match self.inner.lock() {
             Ok(g) => g,
-            Err(_) => return (false, "engine".to_string()),
+            Err(_) => return Some(false),
+        };
+        let inner: &mut FaceInner = &mut guard;
+        let (templates, engine) = (&mut inner.templates, &mut inner.engine);
+        templates.refresh(engine.as_mut(), user);
+        if inner.templates.get(user).is_empty() {
+            return Some(false);
+        }
+        let daemon_mode = capture_mode(inner.require_ir);
+        if mode_mismatch(inner.templates.mode(user), daemon_mode) {
+            return Some(false);
+        }
+        let best = inner
+            .templates
+            .get(user)
+            .iter()
+            .map(|t| align::cosine(embedding, t))
+            .fold(f32::MIN, f32::max);
+        let threshold = inner.threshold;
+        eprintln!("zdrd: release recheck user={user} best cosine={best:.4} threshold={threshold}");
+        Some(best >= threshold)
+    }
+
+    fn verify_scored(&self, user: &str) -> ScoredVerify {
+        let mut guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(_) => return ScoredVerify::unscored(false, "engine".to_string()),
         };
         // Reborrow through a plain &mut so disjoint field borrows work.
         let inner: &mut FaceInner = &mut guard;
@@ -166,7 +199,7 @@ impl Verifier for FaceVerifier {
         templates.refresh(engine.as_mut(), user);
         if inner.templates.get(user).is_empty() {
             // Unknown user or zero templates: fail closed, no capture.
-            return (false, "nomatch".to_string());
+            return ScoredVerify::unscored(false, "nomatch".to_string());
         }
         let daemon_mode = capture_mode(inner.require_ir);
         if mode_mismatch(inner.templates.mode(user), daemon_mode) {
@@ -179,23 +212,23 @@ impl Verifier for FaceVerifier {
                     .unwrap_or("?"),
                 daemon_mode.as_str()
             );
-            return (false, "nomatch".to_string());
+            return ScoredVerify::unscored(false, "nomatch".to_string());
         }
         let templates: Vec<Vec<f32>> = inner.templates.get(user).to_vec();
         let threshold = inner.threshold;
         if inner.require_ir {
             let (rgb_path, ir_path) = match (&inner.rgb_camera, &inner.ir_camera) {
                 (Some(r), Some(i)) => (r.clone(), i.clone()),
-                _ => return (false, "camera".to_string()),
+                _ => return ScoredVerify::unscored(false, "camera".to_string()),
             };
             let paired = match capture::capture_paired(&rgb_path, &ir_path) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("zdrd: capture failed for user={user}: {e}");
-                    return (false, "camera".to_string());
+                    return ScoredVerify::unscored(false, "camera".to_string());
                 }
             };
-            verify_images(
+            verify_images_scored(
                 inner.engine.as_mut(),
                 &templates,
                 &paired.rgb,
@@ -205,16 +238,16 @@ impl Verifier for FaceVerifier {
         } else {
             let rgb_path = match &inner.rgb_camera {
                 Some(r) => r.clone(),
-                None => return (false, "camera".to_string()),
+                None => return ScoredVerify::unscored(false, "camera".to_string()),
             };
             let rgb = match capture::capture_rgb(&rgb_path) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("zdrd: RGB capture failed for user={user}: {e}");
-                    return (false, "camera".to_string());
+                    return ScoredVerify::unscored(false, "camera".to_string());
                 }
             };
-            verify_rgb_image(inner.engine.as_mut(), &templates, &rgb, threshold)
+            verify_rgb_image_scored(inner.engine.as_mut(), &templates, &rgb, threshold)
         }
     }
 }
@@ -222,6 +255,7 @@ impl Verifier for FaceVerifier {
 /// Verify core over already-captured frames (mock-engine testable):
 /// face required in IR first, then in RGB (cross-sensor presence gate),
 /// then the IR face is embedded and compared to the user's IR templates.
+#[allow(dead_code)]
 pub fn verify_images(
     engine: &mut dyn FaceEngine,
     templates: &[Vec<f32>],
@@ -229,8 +263,22 @@ pub fn verify_images(
     ir: &GrayImage,
     threshold: f32,
 ) -> (bool, String) {
+    let scored = verify_images_scored(engine, templates, rgb, ir, threshold);
+    (scored.matched, scored.reason)
+}
+
+/// Scored variant of [`verify_images`]: also carries the single
+/// capture's embedding and best cosine for the AUTHTOK release
+/// re-check, so that check never needs a second capture.
+pub fn verify_images_scored(
+    engine: &mut dyn FaceEngine,
+    templates: &[Vec<f32>],
+    rgb: &RgbImage,
+    ir: &GrayImage,
+    threshold: f32,
+) -> ScoredVerify {
     if templates.is_empty() {
-        return (false, "nomatch".to_string());
+        return ScoredVerify::unscored(false, "nomatch".to_string());
     }
     let ir_rgb = gray_to_rgb(ir);
     let ir_face = match engine.detect(&ir_rgb) {
@@ -242,26 +290,28 @@ pub fn verify_images(
             });
             faces.remove(0)
         }
-        Ok(_) => return (false, "noface-ir".to_string()),
+        Ok(_) => return ScoredVerify::unscored(false, "noface-ir".to_string()),
         Err(e) => {
             eprintln!("zdrd: IR detection failed: {e}");
-            return (false, "engine".to_string());
+            return ScoredVerify::unscored(false, "engine".to_string());
         }
     };
     match engine.detect(rgb) {
         Ok(faces) if !faces.is_empty() => {}
-        Ok(_) => return (false, "noface-rgb".to_string()),
+        Ok(_) => return ScoredVerify::unscored(false, "noface-rgb".to_string()),
         Err(e) => {
             eprintln!("zdrd: RGB detection failed: {e}");
-            return (false, "engine".to_string());
+            return ScoredVerify::unscored(false, "engine".to_string());
         }
     }
     let emb = match engine.embed_face(&ir_rgb, &ir_face) {
         Ok(e) => e,
-        Err(DaemonError::NoFace(_)) => return (false, "noface-ir".to_string()),
+        Err(DaemonError::NoFace(_)) => {
+            return ScoredVerify::unscored(false, "noface-ir".to_string())
+        }
         Err(e) => {
             eprintln!("zdrd: IR embedding failed: {e}");
-            return (false, "engine".to_string());
+            return ScoredVerify::unscored(false, "engine".to_string());
         }
     };
     let best = templates
@@ -272,24 +322,39 @@ pub fn verify_images(
         "zdrd: verify best cosine={best:.4} threshold={threshold} raw_norm={:.3}",
         emb.raw_norm
     );
-    if best >= threshold {
-        (true, "match".to_string())
-    } else {
-        (false, "nomatch".to_string())
+    let matched = best >= threshold;
+    ScoredVerify {
+        matched,
+        reason: if matched { "match" } else { "nomatch" }.to_string(),
+        best_cosine: Some(best),
+        threshold: Some(threshold),
+        embedding: Some(emb.vector),
     }
 }
 
 /// RGB-only verify core (Step 14): exactly the RGB path of the paired
 /// flow — a face must be present in RGB, its embedding is compared
 /// to the user's RGB templates.
+#[allow(dead_code)]
 pub fn verify_rgb_image(
     engine: &mut dyn FaceEngine,
     templates: &[Vec<f32>],
     rgb: &RgbImage,
     threshold: f32,
 ) -> (bool, String) {
+    let scored = verify_rgb_image_scored(engine, templates, rgb, threshold);
+    (scored.matched, scored.reason)
+}
+
+/// Scored variant of [`verify_rgb_image`] (see `verify_images_scored`).
+pub fn verify_rgb_image_scored(
+    engine: &mut dyn FaceEngine,
+    templates: &[Vec<f32>],
+    rgb: &RgbImage,
+    threshold: f32,
+) -> ScoredVerify {
     if templates.is_empty() {
-        return (false, "nomatch".to_string());
+        return ScoredVerify::unscored(false, "nomatch".to_string());
     }
     let face = match engine.detect(rgb) {
         Ok(mut faces) if !faces.is_empty() => {
@@ -300,18 +365,20 @@ pub fn verify_rgb_image(
             });
             faces.remove(0)
         }
-        Ok(_) => return (false, "noface-rgb".to_string()),
+        Ok(_) => return ScoredVerify::unscored(false, "noface-rgb".to_string()),
         Err(e) => {
             eprintln!("zdrd: RGB detection failed: {e}");
-            return (false, "engine".to_string());
+            return ScoredVerify::unscored(false, "engine".to_string());
         }
     };
     let emb = match engine.embed_face(rgb, &face) {
         Ok(e) => e,
-        Err(DaemonError::NoFace(_)) => return (false, "noface-rgb".to_string()),
+        Err(DaemonError::NoFace(_)) => {
+            return ScoredVerify::unscored(false, "noface-rgb".to_string())
+        }
         Err(e) => {
             eprintln!("zdrd: RGB embedding failed: {e}");
-            return (false, "engine".to_string());
+            return ScoredVerify::unscored(false, "engine".to_string());
         }
     };
     let best = templates
@@ -322,10 +389,13 @@ pub fn verify_rgb_image(
         "zdrd: verify (RGB) best cosine={best:.4} threshold={threshold} raw_norm={:.3}",
         emb.raw_norm
     );
-    if best >= threshold {
-        (true, "match".to_string())
-    } else {
-        (false, "nomatch".to_string())
+    let matched = best >= threshold;
+    ScoredVerify {
+        matched,
+        reason: if matched { "match" } else { "nomatch" }.to_string(),
+        best_cosine: Some(best),
+        threshold: Some(threshold),
+        embedding: Some(emb.vector),
     }
 }
 
@@ -392,6 +462,24 @@ mod tests {
         assert!(!m && r == "nomatch");
         let (m, r) = verify_images(&mut eng, &[], &img(4), &gray(4), 0.363);
         assert!(!m && r == "nomatch");
+    }
+
+    #[test]
+    fn scored_verify_carries_embedding_and_best() {
+        let mut eng = MockEngine {
+            embedding: vec![1.0, 0.0],
+        };
+        let scored = verify_images_scored(&mut eng, &[vec![1.0, 0.0]], &img(4), &gray(4), 0.363);
+        assert!(scored.matched && scored.reason == "match");
+        assert_eq!(scored.embedding.as_deref(), Some([1.0, 0.0].as_slice()));
+        assert!(matches!(scored.best_cosine, Some(b) if (b - 1.0).abs() < 1e-6));
+        assert_eq!(scored.threshold, Some(0.363));
+        let scored = verify_rgb_image_scored(&mut eng, &[vec![0.0, 1.0]], &img(4), 0.363);
+        assert!(!scored.matched && scored.reason == "nomatch");
+        assert!(scored.embedding.is_some() && scored.best_cosine.is_some());
+        // No face: nothing to re-check later.
+        let scored = verify_rgb_image_scored(&mut eng, &[vec![1.0, 0.0]], &img(1), 0.363);
+        assert!(!scored.matched && scored.embedding.is_none());
     }
 
     #[test]
