@@ -65,7 +65,18 @@ int main(int argc, char *argv[])
         ? QString::fromUtf8(argv[1])
         : QStringLiteral("/usr/share/zdr/zdr-prompt.qml");
 
+    // The QML finishes via Qt.exit(0|1) / Qt.quit(). Those only emit
+    // QQmlEngine signals; without these connections the application
+    // never exits and the decision is lost (the agent then kills the
+    // prompt at its 35 s timeout and denies). Wire both, and do not
+    // let "last window closed" end the process with code 0 either:
+    // only an explicit QML decision may end this program.
+    QGuiApplication::setQuitOnLastWindowClosed(false);
     QQmlApplicationEngine engine;
+    QObject::connect(&engine, &QQmlApplicationEngine::exit, &app,
+                     [](int code) { QCoreApplication::exit(code); });
+    QObject::connect(&engine, &QQmlApplicationEngine::quit, &app,
+                     &QCoreApplication::quit);
     engine.load(QUrl::fromLocalFile(qmlPath));
     if (engine.rootObjects().isEmpty())
         return 1;
