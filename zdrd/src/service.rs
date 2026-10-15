@@ -76,12 +76,79 @@ impl From<ConsentError> for AuthError {
     }
 }
 
+/// Result of one capture+embedding, carrying everything the AUTHTOK
+/// release re-check needs so it never has to capture a second time:
+/// the embedding from that single capture, plus the best cosine it
+/// scored against the template store and the threshold it was (and
+/// can be re-) compared against. `best_cosine`/`embedding` are `None`
+/// when no embedding was produced (no face, camera/engine failure,
+/// or a verifier that only implements the plain `verify`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScoredVerify {
+    pub matched: bool,
+    pub reason: String,
+    pub best_cosine: Option<f32>,
+    pub threshold: Option<f32>,
+    pub embedding: Option<Vec<f32>>,
+}
+
+impl ScoredVerify {
+    /// A result with no score/embedding to re-check (fail-closed for
+    /// release purposes when `matched` is true).
+    pub fn unscored(matched: bool, reason: String) -> Self {
+        ScoredVerify {
+            matched,
+            reason,
+            best_cosine: None,
+            threshold: None,
+            embedding: None,
+        }
+    }
+}
+
 /// Blocking face verification, run via `spawn_blocking` under a timeout.
 /// Returns `(matched, reason)` using the contract reason strings.
 /// Implementations must fail closed: any internal failure is a reason
 /// string, never a panic.
 pub trait Verifier: Send + Sync {
     fn verify(&self, user: &str) -> (bool, String);
+
+    /// One capture+embedding returning a [`ScoredVerify`]. The default
+    /// wraps `verify` and carries no score/embedding. Implementors
+    /// that can must expose the single capture's embedding and best
+    /// cosine so callers can re-check the release decision without
+    /// touching the cameras again.
+    fn verify_scored(&self, user: &str) -> ScoredVerify {
+        let (matched, reason) = self.verify(user);
+        ScoredVerify::unscored(matched, reason)
+    }
+
+    /// Scored verify with streamed feedback: `capturing` before the
+    /// (single) capture, then exactly one terminal kind matching the
+    /// result. Mirrors `verify_with_feedback`.
+    fn verify_scored_with_feedback(
+        &self,
+        user: &str,
+        feedback: &dyn Fn(FeedbackKind),
+    ) -> ScoredVerify {
+        feedback(FeedbackKind::Capturing);
+        let scored = self.verify_scored(user);
+        feedback(FeedbackKind::terminal_for_verify(
+            scored.matched,
+            &scored.reason,
+        ));
+        scored
+    }
+
+    /// Re-score an embedding from an earlier capture against the
+    /// *current* template store, without capturing. Returns
+    /// `Some(matched)` when this verifier could re-evaluate the
+    /// embedding, or `None` when it cannot (callers then fall back
+    /// to re-checking the stored best cosine, and fail closed when
+    /// there is none). Must never open a camera.
+    fn recheck_embedding(&self, _user: &str, _embedding: &[f32]) -> Option<bool> {
+        None
+    }
 
     /// Whether this verifier requires the IR camera. `false` means
     /// RGB-only mode. Reported read-only via `ServerInfo`.
@@ -251,11 +318,13 @@ async fn emit_feedback(emitter: &SignalEmitter<'_>, request_id: &str, kind: Feed
     }
 }
 
-/// CaptureVerifyAuthtok core, run on the worker thread: verify once,
-/// and only on a match touch the sealed blob. After a successful
-/// unseal the match is verified a *second* time against the template
-/// store (defence in depth: the released bytes are the user's real
-/// password, so one capture must not be enough to extract them)
+/// CaptureVerifyAuthtok core, run on the worker thread: ONE
+/// capture+embedding per request, and only on a match touch the
+/// sealed blob. After a successful unseal the *same* embedding is
+/// re-checked against the template store (defence in depth without
+/// a second capture: the released bytes are the user's real
+/// password, so the store/threshold decision is re-evaluated at
+/// release time and store changes since capture are honoured)
 /// before the password leaves the daemon. Every failure path returns
 /// an empty password; the unsealed SecretBytes is dropped (zeroized)
 /// here whenever it is not returned. Logs carry user + request id
@@ -268,7 +337,8 @@ fn verify_and_release(
     auth_dir: &Path,
     feedback: &dyn Fn(FeedbackKind),
 ) -> (bool, String, Option<SecretBytes>) {
-    let (matched, reason) = verifier.verify_with_feedback(user, feedback);
+    let scored = verifier.verify_scored_with_feedback(user, feedback);
+    let (matched, reason) = (scored.matched, scored.reason.clone());
     if !matched {
         return (matched, reason, None);
     }
@@ -284,18 +354,34 @@ fn verify_and_release(
             return (false, "engine".to_string(), None);
         }
     };
-    let (matched2, reason2) = verifier.verify_with_feedback(user, feedback);
-    if !matched2 {
+    // Release re-check, no second capture: re-score the single
+    // capture's embedding against the current store when the seam
+    // allows it; otherwise re-check the stored best cosine against
+    // the threshold. No score to re-check at all fails closed.
+    let release_ok = match scored.embedding.as_deref() {
+        Some(embedding) => match verifier.recheck_embedding(user, embedding) {
+            Some(ok) => ok,
+            None => matches!(
+                (scored.best_cosine, scored.threshold),
+                (Some(best), Some(threshold)) if best >= threshold
+            ),
+        },
+        None => matches!(
+            (scored.best_cosine, scored.threshold),
+            (Some(best), Some(threshold)) if best >= threshold
+        ),
+    };
+    if !release_ok {
         eprintln!(
-            "zdrd: CaptureVerifyAuthtok second verify failed user={user} id={request_id} reason={reason2}"
+            "zdrd: CaptureVerifyAuthtok release recheck failed user={user} id={request_id} reason=nomatch"
         );
         // `secret` drops here and is zeroized, never returned.
-        return (false, reason2, None);
+        return (false, "nomatch".to_string(), None);
     }
     eprintln!(
-        "zdrd: CaptureVerifyAuthtok unseal ok, second verify matched user={user} id={request_id}"
+        "zdrd: CaptureVerifyAuthtok unseal ok, release recheck matched user={user} id={request_id}"
     );
-    (true, reason2, Some(secret))
+    (true, reason, Some(secret))
 }
 
 #[interface(name = "org.zdr.Authenticator")]
@@ -557,8 +643,9 @@ impl Authenticator {
 
     /// Step 15: CaptureVerify plus TPM-sealed password release.
     /// Consumes the approved request exactly once, like CaptureVerify;
-    /// only after a match is the blob unsealed, and the match is then
-    /// verified a second time inside the daemon (see
+    /// a single capture feeds both decisions: only after a match is
+    /// the blob unsealed, and the same embedding is then re-checked
+    /// against the template store inside the daemon (see
     /// `verify_and_release`) before any password byte is returned.
     /// The daemon-owned SecretBytes is copied into the D-Bus return
     /// value and zeroized before this handler returns.
@@ -868,25 +955,62 @@ mod tests {
 
     // ---- Step 15: verify_and_release (fake runner, no TPM) ----
 
-    struct SeqVerifier {
-        results: Mutex<std::collections::VecDeque<(bool, &'static str)>>,
+    /// Fake verifier for the single-capture AUTHTOK flow: every
+    /// capture-verify entry point (`verify` and `verify_scored`)
+    /// bumps the same counter, so tests can prove exactly one
+    /// capture happened per request. `recheck` is what the
+    /// no-capture release re-check returns.
+    struct CountingVerifier {
+        calls: Mutex<usize>,
+        recheck_calls: Mutex<usize>,
+        scored: ScoredVerify,
+        recheck: Option<bool>,
     }
-    impl SeqVerifier {
-        fn new(results: &[(bool, &'static str)]) -> Self {
-            SeqVerifier {
-                results: Mutex::new(results.iter().copied().collect()),
+    impl CountingVerifier {
+        fn new(scored: ScoredVerify, recheck: Option<bool>) -> Self {
+            CountingVerifier {
+                calls: Mutex::new(0),
+                recheck_calls: Mutex::new(0),
+                scored,
+                recheck,
+            }
+        }
+        fn calls(&self) -> usize {
+            *self.calls.lock().expect("calls")
+        }
+        fn recheck_calls(&self) -> usize {
+            *self.recheck_calls.lock().expect("recheck calls")
+        }
+        fn count(&self) {
+            if let Ok(mut n) = self.calls.lock() {
+                *n += 1;
             }
         }
     }
-    impl Verifier for SeqVerifier {
+    impl Verifier for CountingVerifier {
         fn verify(&self, _user: &str) -> (bool, String) {
-            match self.results.lock() {
-                Ok(mut q) => q
-                    .pop_front()
-                    .map(|(m, r)| (m, r.to_string()))
-                    .unwrap_or((false, "nomatch".to_string())),
-                Err(_) => (false, "engine".to_string()),
+            self.count();
+            (self.scored.matched, self.scored.reason.clone())
+        }
+        fn verify_scored(&self, _user: &str) -> ScoredVerify {
+            self.count();
+            self.scored.clone()
+        }
+        fn recheck_embedding(&self, _user: &str, _embedding: &[f32]) -> Option<bool> {
+            if let Ok(mut n) = self.recheck_calls.lock() {
+                *n += 1;
             }
+            self.recheck
+        }
+    }
+
+    fn scored_match() -> ScoredVerify {
+        ScoredVerify {
+            matched: true,
+            reason: "match".to_string(),
+            best_cosine: Some(0.9),
+            threshold: Some(0.363),
+            embedding: Some(vec![1.0, 0.0]),
         }
     }
 
@@ -937,7 +1061,7 @@ mod tests {
     fn no_feedback(_: FeedbackKind) {}
 
     #[test]
-    fn authtok_releases_password_after_second_match() {
+    fn authtok_releases_password_after_single_capture() {
         let (dir, sealer, runner) = release_setup(
             "release",
             true,
@@ -947,13 +1071,23 @@ mod tests {
                 success: true,
             },
         );
-        let verifier = SeqVerifier::new(&[(true, "match"), (true, "match")]);
+        let verifier = CountingVerifier::new(scored_match(), Some(true));
+        let seen = RefCell::new(Vec::new());
+        let cb = |k: FeedbackKind| seen.borrow_mut().push(k);
         let (matched, reason, secret) =
-            verify_and_release(&verifier, "alice", "req1", &sealer, &dir, &no_feedback);
+            verify_and_release(&verifier, "alice", "req1", &sealer, &dir, &cb);
         assert!(matched && reason == "match");
         let secret = secret.expect("password released");
         assert_eq!(secret.as_slice(), b"the-real-password");
         assert_eq!(*runner.decrypt_calls.lock().expect("calls"), 1);
+        // The point of the change: one capture-verify per request,
+        // one no-capture re-check, one capturing + one terminal kind.
+        assert_eq!(verifier.calls(), 1, "verify must run exactly once");
+        assert_eq!(verifier.recheck_calls(), 1);
+        assert_eq!(
+            seen.into_inner(),
+            vec![FeedbackKind::Capturing, FeedbackKind::Matched]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -968,12 +1102,14 @@ mod tests {
                 success: true,
             },
         );
-        let verifier = SeqVerifier::new(&[(true, "match")]);
+        let verifier = CountingVerifier::new(scored_match(), Some(true));
         let (matched, reason, secret) =
             verify_and_release(&verifier, "alice", "req1", &sealer, &dir, &no_feedback);
         assert!(matched && reason == "match");
         assert!(secret.is_none());
         assert_eq!(*runner.decrypt_calls.lock().expect("calls"), 0);
+        assert_eq!(verifier.calls(), 1, "verify must run exactly once");
+        assert_eq!(verifier.recheck_calls(), 0, "no blob, no release re-check");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -988,19 +1124,24 @@ mod tests {
                 success: true,
             },
         );
-        let verifier = SeqVerifier::new(&[(false, "nomatch")]);
+        let verifier = CountingVerifier::new(
+            ScoredVerify::unscored(false, "nomatch".to_string()),
+            Some(true),
+        );
         let (matched, reason, secret) =
             verify_and_release(&verifier, "alice", "req1", &sealer, &dir, &no_feedback);
         assert!(!matched && reason == "nomatch");
         assert!(secret.is_none());
         assert_eq!(*runner.decrypt_calls.lock().expect("calls"), 0);
+        assert_eq!(verifier.calls(), 1, "verify must run exactly once");
+        assert_eq!(verifier.recheck_calls(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn authtok_second_verify_failure_withholds_password() {
+    fn authtok_release_recheck_failure_withholds_password() {
         let (dir, sealer, runner) = release_setup(
-            "secondfail",
+            "recheckfail",
             true,
             FakeSealRunner {
                 decrypt_calls: Mutex::new(0),
@@ -1008,12 +1149,73 @@ mod tests {
                 success: true,
             },
         );
-        let verifier = SeqVerifier::new(&[(true, "match"), (false, "nomatch")]);
+        // Single capture matched, but re-scoring its embedding
+        // against the (now changed) store no longer passes.
+        let verifier = CountingVerifier::new(scored_match(), Some(false));
         let (matched, reason, secret) =
             verify_and_release(&verifier, "alice", "req1", &sealer, &dir, &no_feedback);
         assert!(!matched && reason == "nomatch");
         assert!(secret.is_none(), "password must be withheld and dropped");
         assert_eq!(*runner.decrypt_calls.lock().expect("calls"), 1);
+        assert_eq!(verifier.calls(), 1, "re-check must not re-capture");
+        assert_eq!(verifier.recheck_calls(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn authtok_release_recheck_falls_back_to_stored_score() {
+        let (dir, sealer, _runner) = release_setup(
+            "recheckfallback",
+            true,
+            FakeSealRunner {
+                decrypt_calls: Mutex::new(0),
+                stdout: b"the-real-password".to_vec(),
+                success: true,
+            },
+        );
+        // Verifier cannot re-score embeddings (recheck -> None) but
+        // exposed a passing best cosine: the stored score is
+        // re-checked against the threshold instead of re-capturing.
+        let verifier = CountingVerifier::new(scored_match(), None);
+        let (matched, reason, secret) =
+            verify_and_release(&verifier, "alice", "req1", &sealer, &dir, &no_feedback);
+        assert!(matched && reason == "match");
+        assert!(secret.is_some());
+        assert_eq!(verifier.calls(), 1, "verify must run exactly once");
+        assert_eq!(verifier.recheck_calls(), 1);
+
+        // Same shape but the stored score fails the threshold on
+        // re-check: withheld, still without a second capture.
+        let mut failing = scored_match();
+        failing.best_cosine = Some(0.1);
+        let verifier = CountingVerifier::new(failing, None);
+        let (matched, reason, secret) =
+            verify_and_release(&verifier, "alice", "req1", &sealer, &dir, &no_feedback);
+        assert!(!matched && reason == "nomatch");
+        assert!(secret.is_none());
+        assert_eq!(verifier.calls(), 1, "verify must run exactly once");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn authtok_matched_without_any_score_fails_closed() {
+        let (dir, sealer, _runner) = release_setup(
+            "noscore",
+            true,
+            FakeSealRunner {
+                decrypt_calls: Mutex::new(0),
+                stdout: b"the-real-password".to_vec(),
+                success: true,
+            },
+        );
+        // Matched but nothing re-checkable was carried: never release.
+        let verifier =
+            CountingVerifier::new(ScoredVerify::unscored(true, "match".to_string()), None);
+        let (matched, reason, secret) =
+            verify_and_release(&verifier, "alice", "req1", &sealer, &dir, &no_feedback);
+        assert!(!matched && reason == "nomatch");
+        assert!(secret.is_none());
+        assert_eq!(verifier.calls(), 1, "verify must run exactly once");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1028,11 +1230,17 @@ mod tests {
                 success: false,
             },
         );
-        let verifier = SeqVerifier::new(&[(true, "match")]);
+        let verifier = CountingVerifier::new(scored_match(), Some(true));
         let (matched, reason, secret) =
             verify_and_release(&verifier, "alice", "req1", &sealer, &dir, &no_feedback);
         assert!(!matched && reason == "engine");
         assert!(secret.is_none());
+        assert_eq!(verifier.calls(), 1, "verify must run exactly once");
+        assert_eq!(
+            verifier.recheck_calls(),
+            0,
+            "no re-check after unseal failure"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
