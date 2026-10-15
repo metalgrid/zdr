@@ -56,13 +56,18 @@ Who may release: only a root caller of
 i.e. the root PAM module, and only bound to a fresh consent request
 that was approved and is consumed exactly once, exactly like
 `CaptureVerify` (reason strings are identical). The flow is:
-consume request → face verify → only on a match, unseal (10 s cap,
-inside the same worker thread, under the 15 s capture budget plus
-that cap) → verify the face a *second* time against the template
-store → only then return the password bytes, zeroizing the daemon
-copy before returning. No match means no unseal attempt is ever
-made. A match with no sealed blob returns `password` empty (not an
-error). `EnrollPassword(user, password)` is root-only;
+consume request → ONE face capture+embedding → only on a match,
+unseal (10 s cap, inside the same worker thread, under the 15 s
+capture budget plus that cap) → re-check that same embedding
+against the template store (best cosine recomputed from the
+embedding, compared to the threshold; no second capture) → only
+then return the password bytes, zeroizing the daemon copy before
+returning. Exactly one `capturing` and one terminal `AuthFeedback`
+kind are emitted per request. No match means no unseal attempt is
+ever made; a release re-check that no longer passes (e.g. the
+templates changed after capture) withholds the password with
+reason `nomatch`. A match with no sealed blob returns `password`
+empty (not an error). `EnrollPassword(user, password)` is root-only;
 `HasSealedPassword(user) -> has` may be called by any uid and
 reveals existence only.
 
@@ -81,6 +86,19 @@ the face), not an implementation bug; enrolling a sealed password
 is what opts a user into it. `sudo zdrctl remove <user>` deletes
 `password.cred` along with the templates, and `zdrctl list` shows
 `sealed password: yes/no` per user.
+
+## Camera warm-up (adaptive)
+
+Each sensor capture takes at least 3 frames, then stops as soon as
+the mean brightness settles (frame-to-frame change ≤ 2.0 on the
+0-255 scale), and never takes more than 11 frames per stream
+(previously a fixed 10 warm-up frames were discarded plus 1 kept,
+per sensor, per capture). Every capture logs one line, e.g.
+`zdrd: capture ir frames=4 settle=early` (`settle=cap` when the
+brightness never stabilised within 11 frames), so the effect is
+visible in the journal. Streams are still started per capture:
+one paired (RGB then IR) capture per `CaptureVerify`, and one
+paired capture per `CaptureVerifyAuthtok`.
 
 ## Feedback signal
 
