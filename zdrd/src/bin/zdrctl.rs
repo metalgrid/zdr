@@ -60,7 +60,7 @@ fn print_usage() {
     eprintln!(
         "usage:\n  zdrctl enroll [user]          guided 5-capture enrollment (run with sudo)\n  \
          zdrctl enroll-password [--user <name>]  seal a login password to the TPM (run with sudo)\n  \
-         zdrctl list [--auth-dir DIR]  per-user template counts and sealed-password presence\n  \
+         zdrctl list [--auth-dir DIR]  per-user template counts and sealed-password presence (run with sudo)\n  \
          zdrctl remove <user> [--auth-dir DIR]   removes templates and any sealed password\n  \
          zdrctl test <user>            how to test an enrollment"
     );
@@ -442,6 +442,14 @@ fn cmd_list(args: &[String]) -> Result<(), String> {
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.is_dir())
             .collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            // The auth dir is root-only by design (0700): templates and
+            // sealed passwords must not be listable by other users.
+            return Err(format!(
+                "reading {}: permission denied (the template store is root-only; run: sudo zdrctl list)",
+                auth_dir.display()
+            ));
+        }
         Err(e) => return Err(format!("reading {}: {e}", auth_dir.display())),
     };
     users.sort();
