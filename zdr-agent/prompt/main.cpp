@@ -32,9 +32,12 @@
 #include <QQuickWindow>
 #include <QUrl>
 
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <thread>
+
+#include <unistd.h>
 
 #if __has_include(<LayerShellQt/Window.h>)
 #include <LayerShellQt/Window.h>
@@ -88,35 +91,49 @@ int main(int argc, char *argv[])
     // ignored, and EOF (agent gone / stdin closed) just ends the
     // thread — the countdown and exit-code contract are untouched.
     // Under qml6 there is no host, so the QML defaults stand.
+    //
+    // Raw read(), NOT std::getline(std::cin): a thread blocked
+    // inside a libstdc++ stream operation holds the stream lock,
+    // and process exit then deadlocks destroying std::cin. With
+    // the agent's held-open stdin pipe that froze every decided
+    // prompt until the agent killed it (seen live 2026-10-15).
     {
         QPointer<QObject> rootObject(engine.rootObjects().constFirst());
         std::thread([rootObject]() {
-            std::string raw;
-            while (std::getline(std::cin, raw)) {
-                const QString line = QString::fromUtf8(raw.c_str()).trimmed();
-                QString property;
-                QString value;
-                if (line.startsWith(QStringLiteral("status-kind: "))) {
-                    property = QStringLiteral("statusKind");
-                    value = line.mid(13);
-                } else if (line.startsWith(QStringLiteral("status: "))) {
-                    property = QStringLiteral("statusText");
-                    value = line.mid(8);
-                } else {
-                    continue;
+            std::string pending;
+            char chunk[512];
+            ssize_t nread;
+            while ((nread = ::read(STDIN_FILENO, chunk, sizeof(chunk))) > 0) {
+                pending.append(chunk, static_cast<size_t>(nread));
+                size_t newline;
+                while ((newline = pending.find('\n')) != std::string::npos) {
+                    const std::string raw = pending.substr(0, newline);
+                    pending.erase(0, newline + 1);
+                    const QString line = QString::fromUtf8(raw.c_str()).trimmed();
+                    QString property;
+                    QString value;
+                    if (line.startsWith(QStringLiteral("status-kind: "))) {
+                        property = QStringLiteral("statusKind");
+                        value = line.mid(13);
+                    } else if (line.startsWith(QStringLiteral("status: "))) {
+                        property = QStringLiteral("statusText");
+                        value = line.mid(8);
+                    } else {
+                        continue;
+                    }
+                    if (!rootObject)
+                        return;
+                    QMetaObject::invokeMethod(
+                        rootObject,
+                        [rootObject, property, value]() {
+                            // std::cerr, not qDebug: Qt may have debug
+                            // output routed away in the session.
+                            if (rootObject && rootObject->setProperty(
+                                                   property.toUtf8().constData(), value))
+                                std::cerr << "zdr-prompt: status update applied\n";
+                        },
+                        Qt::QueuedConnection);
                 }
-                if (!rootObject)
-                    return;
-                QMetaObject::invokeMethod(
-                    rootObject,
-                    [rootObject, property, value]() {
-                        // std::cerr, not qDebug: Qt may have debug
-                        // output routed away in the session.
-                        if (rootObject && rootObject->setProperty(
-                                               property.toUtf8().constData(), value))
-                            std::cerr << "zdr-prompt: status update applied\n";
-                    },
-                    Qt::QueuedConnection);
             }
         }).detach();
     }
@@ -139,5 +156,9 @@ int main(int argc, char *argv[])
     }
 #endif
 
-    return app.exec();
+    const int rc = app.exec();
+    // Skip static destruction entirely: a detached reader thread may
+    // still sit in read(), and no destructor may ever delay or hang
+    // a decided prompt's exit.
+    std::_Exit(rc);
 }
