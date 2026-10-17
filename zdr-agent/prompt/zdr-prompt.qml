@@ -85,9 +85,23 @@ Window {
     property real totalSeconds: 30
     property real remainingSeconds: 30
     property bool decided: false
+    // Input stays disarmed for the first second so a prompt that
+    // appears while the user is typing cannot swallow the next
+    // Enter keystroke (or a click already in flight) as an approval.
+    // Internal denies (countdown expiry, window close) bypass it.
+    property bool inputArmed: false
 
-    function decide(approved) {
+    Timer {
+        id: armTimer
+        interval: 1000
+        running: true
+        onTriggered: root.inputArmed = true
+    }
+
+    function decide(approved, internal) {
         if (root.decided)
+            return;
+        if (!root.inputArmed && !internal)
             return;
         root.decided = true;
         countdown.stop();
@@ -241,15 +255,17 @@ Window {
     onClosing: function(close) {
         // Any window close that is not an explicit decision denies.
         if (!root.decided)
-            root.decide(false);
+            root.decide(false, true);
     }
 
     Shortcut {
         sequences: ["Return", "Enter"]
+        enabled: root.inputArmed
         onActivated: root.decide(true)
     }
     Shortcut {
         sequence: "Escape"
+        enabled: root.inputArmed
         onActivated: root.decide(false)
     }
 
@@ -262,7 +278,7 @@ Window {
             root.remainingSeconds -= interval / 1000;
             if (root.remainingSeconds <= 0) {
                 root.remainingSeconds = 0;
-                root.decide(false);
+                root.decide(false, true);
             }
         }
     }
@@ -388,6 +404,8 @@ Window {
 
             Button {
                 id: denyButton
+                enabled: root.inputArmed
+                opacity: enabled ? 1 : 0.45
                 text: "Deny"
                 font.family: root.fontFamily
                 font.pixelSize: 14
@@ -411,6 +429,8 @@ Window {
 
             Button {
                 id: approveButton
+                enabled: root.inputArmed
+                opacity: enabled ? 1 : 0.45
                 text: "Approve and scan"
                 font.family: root.fontFamily
                 font.pixelSize: 14
