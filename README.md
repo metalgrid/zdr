@@ -14,6 +14,10 @@ your own copies).
 
 # Running
 
+Full manual setup (sudo, polkit, greeters, keyring unlock, testing and
+recovery) is in [docs/manual-setup.md](docs/manual-setup.md). Distro PAM
+integration lives under [packaging/](packaging/README.md). The short form:
+
 ## The daemon
 
 Place the configuration from `dbus-1` into `/usr/share/dbus-1/system.d`.
@@ -61,21 +65,17 @@ are required. Cameras are captured at 640-wide (RGB MJPG 640x480, IR GREY
   `"camera"`, `"engine"`.
 - `Cancel(request_id) -> ()` — root only.
 
-### Interim templates (Step 5 replaces this)
+### Templates and enrollment
 
-Until real enrollment lands, templates are IR image files on disk:
-
-```
-/var/lib/zdr/<user>/ir*.png
-```
-
-At startup and again on every `CaptureVerify`, each `ir*.png` for that
-user is embedded with SFace and cached. CaptureVerify checks only the
-requesting user's templates: an IR face must be present, an RGB face
-must also be present (cross-sensor gate), and the best cosine similarity
-of the live IR embedding against the user's templates must be
-`>= --threshold`. Unknown users and users with no usable IR templates
-fail closed with reason `"nomatch"` (and no camera is opened).
+Enrollment is guided: `sudo zdrctl enroll` captures five quality-gated
+poses and stores 128-float SFace embeddings in
+`/var/lib/zdr/<user>/templates.bin` (mode 0600; legacy `ir*.png` files
+import once). CaptureVerify checks only the requesting user's templates:
+an IR face must be present, an RGB face must also be present
+(cross-sensor gate), and the best cosine similarity of the live IR
+embedding against the user's templates must be `>= threshold`
+(`/etc/zdr/zdrd.toml`, default 0.363). Unknown users fail closed with
+reason `"nomatch"` (and no camera is opened for them).
 
 ## The PAM plugin
 

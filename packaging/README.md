@@ -1,5 +1,10 @@
 # Packaging
 
+For how the system works and the full manual wiring (testing,
+recovery, per-service stacks), read
+[`docs/manual-setup.md`](../docs/manual-setup.md) first. This
+directory only covers how each distro's tooling consumes the result.
+
 Per-distro packaging and PAM integration for zdr. The PAM fragments
 here are inputs for each distro's own profile system, which owns
 regenerating the live configuration — none of them edits `/etc/pam.d`
