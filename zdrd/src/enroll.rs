@@ -14,6 +14,7 @@
 
 use crate::align;
 use crate::capture::gray_to_rgb;
+use crate::consent::Caller;
 use crate::engine::FaceEngine;
 use crate::error::DaemonError;
 use crate::feedback::FeedbackKind;
@@ -54,6 +55,8 @@ pub enum EnrollError {
     Expired,
     /// Finish attempted before `NEEDED` captures.
     NotReady,
+    /// The caller is neither root nor the caller that began the session.
+    AccessDenied,
 }
 
 impl std::fmt::Display for EnrollError {
@@ -63,6 +66,7 @@ impl std::fmt::Display for EnrollError {
             EnrollError::Unknown => "unknown enrollment session",
             EnrollError::Expired => "enrollment session expired",
             EnrollError::NotReady => "enrollment is not ready (fewer than 5 captures)",
+            EnrollError::AccessDenied => "caller is not authorized for this enrollment session",
         };
         f.write_str(s)
     }
@@ -83,6 +87,10 @@ struct Session {
     user: String,
     embeddings: Vec<Vec<f32>>,
     expires_at: Instant,
+    /// Caller that began the session (unique bus name + uid), recorded
+    /// by `BeginEnroll`. Only this caller, or any uid 0 caller, may use
+    /// the session afterwards.
+    caller: Caller,
 }
 
 pub struct Enrollments {
@@ -110,7 +118,30 @@ impl Enrollments {
         }
     }
 
+    /// Begin a session bound to an implicit root caller. Kept for the
+    /// pre-GUI callers/tests; the D-Bus layer uses `begin_with_caller`.
     pub fn begin(&mut self, enroll_id: &str, user: &str, now: Instant) -> Result<(), EnrollError> {
+        self.begin_with_caller(
+            enroll_id,
+            user,
+            now,
+            &Caller {
+                sender: String::new(),
+                uid: 0,
+            },
+        )
+    }
+
+    /// Begin a session and bind it to `caller`: later session use is
+    /// restricted to that exact caller (unique bus name + uid) or to
+    /// any uid 0 caller (see `check_caller`).
+    pub fn begin_with_caller(
+        &mut self,
+        enroll_id: &str,
+        user: &str,
+        now: Instant,
+        caller: &Caller,
+    ) -> Result<(), EnrollError> {
         self.sweep_user(user, now);
         if self.by_user.contains_key(user) {
             return Err(EnrollError::Busy);
@@ -121,10 +152,34 @@ impl Enrollments {
                 user: user.to_string(),
                 embeddings: Vec::new(),
                 expires_at: now + self.ttl,
+                caller: caller.clone(),
             },
         );
         self.by_user.insert(user.to_string(), enroll_id.to_string());
         Ok(())
+    }
+
+    /// The caller recorded when this session began.
+    pub fn caller_for(&mut self, enroll_id: &str, now: Instant) -> Result<Caller, EnrollError> {
+        Ok(self.live(enroll_id, now)?.caller.clone())
+    }
+
+    /// Whether `caller` may use this session: uid 0 always may;
+    /// anyone else must be the exact caller that began it (same
+    /// unique bus name and uid). Unknown/expired sessions report
+    /// their usual errors, never `AccessDenied`.
+    pub fn check_caller(
+        &mut self,
+        enroll_id: &str,
+        caller: &Caller,
+        now: Instant,
+    ) -> Result<(), EnrollError> {
+        let session = self.live(enroll_id, now)?;
+        if caller.uid == 0 || *caller == session.caller {
+            Ok(())
+        } else {
+            Err(EnrollError::AccessDenied)
+        }
     }
 
     fn sweep_user(&mut self, user: &str, now: Instant) {
@@ -584,6 +639,70 @@ mod tests {
         assert_eq!(e.captured_for("enr1", later), Err(EnrollError::Expired));
         assert!(e.begin("enr3", "alice", later).is_ok());
         assert_eq!(e.captured_for("nope", later), Err(EnrollError::Unknown));
+    }
+
+    #[test]
+    fn session_binds_to_beginning_caller() {
+        let mut e = Enrollments::new();
+        let now = Instant::now();
+        let alice = Caller {
+            sender: ":1.42".to_string(),
+            uid: 1000,
+        };
+        e.begin_with_caller("enr1", "alice", now, &alice)
+            .expect("begin");
+        assert_eq!(e.caller_for("enr1", now), Ok(alice.clone()));
+        // The same caller may use the session.
+        assert_eq!(e.check_caller("enr1", &alice, now), Ok(()));
+        // A different sender (even with the same uid) may not.
+        let other_sender = Caller {
+            sender: ":1.99".to_string(),
+            uid: 1000,
+        };
+        assert_eq!(
+            e.check_caller("enr1", &other_sender, now),
+            Err(EnrollError::AccessDenied)
+        );
+        // A different uid may not, whatever its sender name.
+        let other_uid = Caller {
+            sender: ":1.42".to_string(),
+            uid: 1001,
+        };
+        assert_eq!(
+            e.check_caller("enr1", &other_uid, now),
+            Err(EnrollError::AccessDenied)
+        );
+        // Root may use any session, from any sender name.
+        let root = Caller {
+            sender: ":1.7".to_string(),
+            uid: 0,
+        };
+        assert_eq!(e.check_caller("enr1", &root, now), Ok(()));
+        // Unknown sessions stay Unknown, not AccessDenied.
+        assert_eq!(
+            e.check_caller("nope", &alice, now),
+            Err(EnrollError::Unknown)
+        );
+    }
+
+    #[test]
+    fn plain_begin_binds_root_only() {
+        // Sessions begun through the legacy `begin` are usable by root
+        // only: no non-root caller matches the implicit root binding.
+        let (mut e, now) = setup();
+        let alice = Caller {
+            sender: ":1.42".to_string(),
+            uid: 1000,
+        };
+        assert_eq!(
+            e.check_caller("enr1", &alice, now),
+            Err(EnrollError::AccessDenied)
+        );
+        let root = Caller {
+            sender: ":1.7".to_string(),
+            uid: 0,
+        };
+        assert_eq!(e.check_caller("enr1", &root, now), Ok(()));
     }
 
     #[test]
