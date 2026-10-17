@@ -126,12 +126,42 @@ written, and the PNGs are left untouched.
 
 ## Enrollment
 
-Root-only D-Bus methods (same sender checks as `BeginAuth`):
-`BeginEnroll(user) -> enroll_id` (one session per user, 120 s
-expiry, 5 captures needed), `EnrollCapture(enroll_id) -> (state,
-captured, needed, kind)` with state in `captured|rejected|ready`,
+D-Bus methods: `BeginEnroll(user) -> enroll_id` (one session per
+user, 120 s expiry, 5 captures needed), `EnrollCapture(enroll_id)
+-> (state, captured, needed, kind)` with state in
+`captured|rejected|ready`, `EnrollCaptureWithPreview(enroll_id)
+-> (state, captured, needed, kind, rgb_png, ir_png)`,
 `FinishEnroll(enroll_id) -> stored` (writes `templates.bin` and
 reloads the daemon's in-memory templates), `CancelEnroll(enroll_id)`.
+
+Authorization: a caller may use these methods iff it is uid 0
+(the original root flow, e.g. `sudo zdrctl enroll`), or — for
+`BeginEnroll` only — it is the enrollment target user themselves
+(caller uid equals the target user's uid) *and* a polkit
+`CheckAuthorization` for action `org.zdr.Authenticator.Enroll`
+succeeds (flags: AllowUserInteraction; denial or any polkit/bus
+error fails closed). `BeginEnroll` records its caller (unique bus
+name + uid) in the session; `EnrollCapture`,
+`EnrollCaptureWithPreview`, `FinishEnroll` and `CancelEnroll`
+then accept only that same caller or uid 0. A non-root caller can
+never enroll a different user, and polkit is not consulted in
+that case. The polkit action is defined in
+`packaging/polkit/org.zdr.Authenticator.policy` (all of
+allow_any/allow_inactive/allow_active are `auth_self`); it
+installs to `/usr/share/polkit-1/actions/` (packaging wiring
+lives outside this crate). Live polkit/bus authorization is
+untested — it is covered only at the unit level (decision logic
+with injected allow/deny, caller binding, argument encoding);
+no live polkit agent, camera or root bus was exercised.
+
+`EnrollCaptureWithPreview` runs the identical capture, quality
+gates and session storage as `EnrollCapture` (one shared core;
+the plain method discards the stills) and additionally returns
+PNG encodings of the frames judged in that attempt — accepted or
+rejected, so a GUI can show what the camera saw. Encoding happens
+in the capture worker thread under the same 15 s budget. On
+camera/engine failure both arrays are empty and `kind` is
+`error`; in RGB-only mode `ir_png` is empty.
 
 Per-capture quality gates: exactly one face in IR and in RGB, IR
 mean brightness in [20, 230], and cosine < 0.995 against every
