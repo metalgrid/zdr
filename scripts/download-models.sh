@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Download the YuNet + SFace ONNX models into spike/models/ (gitignored).
+# Download the YuNet + SFace ONNX models into models/ at the repo root (gitignored).
+# The Arch package fetches the same files as checked sources; this script
+# is for source builds. Point zdrd.toml yunet/sface at the result.
 # Models are never committed. SHA-256 hashes are pinned below: every run
 # verifies an existing file and re-downloads + re-verifies on mismatch.
 set -euo pipefail
