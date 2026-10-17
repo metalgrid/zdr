@@ -1,143 +1,82 @@
 # zdr
 
-**zdr** — from **здравей** (*zdravei*), "hello" in Bulgarian.
+**zdr** — short for **здравей** (*zdravei*), Bulgarian for "hello".
 
-Face authentication for Linux that asks before it looks. A PAM module,
-a system daemon, and a session agent run a short ceremony for every
-authentication: something requests auth, a prompt asks *you* whether
-to scan, and only after your explicit approval does the camera open,
-capture paired RGB + IR frames, and match your face. No silent
-`snap, compare` moment exists anywhere in the design.
+This is a face unlock for Linux that says hello back only after you
+say it may.
 
-> **Status:** experimental security software, in daily use on the
-> author's machine (`sudo` and polkit). It fails closed to the
-> password prompt everywhere, but it has had no independent security
-> audit. Test with a root shell held open before trusting it.
+## Why this exists
 
-## How it works
+I wrote the first version of this years ago as a toy: something ran
+`sudo`, the camera snapped a picture, and if it was my face, it went
+through. It worked, and it creeped me out. If I'm sitting at the
+laptop anyway — and I usually am — then anything that manages to run
+`sudo` gets authenticated as me, whether I wanted it or not. That's
+why the project died.
 
-| Component | Runs as | Job |
-|---|---|---|
-| `zdrd` | root, systemd service | Owns the cameras and the ONNX models. The only process that ever captures a face. Serves `org.zdr.Authenticator` on the system bus. |
-| `pam_zdr.so` | inside the authenticating process | Drives one consent-gated check per PAM attempt. Never touches a camera. |
-| `zdr-agent` | your session | Shows the consent prompt. Only its registered connection may answer for you. |
-| `zdrctl` | root, via `sudo` | Enrollment and administration. |
+This rewrite is built around fixing exactly that. Nothing scans your
+face because a process asked nicely. You get a prompt first: *this
+thing wants authentication — scan?* You click yes or no. Only then
+does a camera open. The face is the credential; the click is the
+intent, and I never want the two confused.
 
-One authentication:
+## So what happens when I run sudo
 
-1. A PAM stack reaches `pam_zdr.so`. Remote sessions are rejected at
-   once; a local camera never opens for `sshd`.
-2. The daemon creates a one-shot request (30 s life, one per user,
-   a short cooldown after each denial) and picks a consent channel:
-   the session agent if registered, otherwise a terminal `[y/N]`
-   prompt through the PAM conversation.
-3. You approve or deny. Input stays inert for the first second, so a
-   keystroke already in flight cannot become an approval. Deny,
-   timeout, EOF, and Ctrl-C all mean no — and no camera has opened.
-4. After approval the daemon captures RGB (640×480) and IR (640×360),
-   requires exactly one face in each, and compares the IR embedding
-   against *only that user's* templates.
-5. The result returns to PAM. Every failure shape — denial, no
-   match, no camera, dead daemon — falls through to the password
-   prompt.
+A window pops up telling you what's asking (service, terminal, the
+command line when we can see it). You approve, glance at the camera,
+done — usually in about a second. Deny it, ignore it, or let it time
+out, and you get the ordinary password prompt, like zdr was never
+there. There's a short grace period where the buttons don't react,
+so the Enter you were already pressing in some other window can't
+accidentally approve anything.
 
-Recognition is YuNet (detection) + SFace (128-float embeddings) over
-ONNX Runtime via the `ort` crate. On the development machine: ~4 ms
-detection, ~12 ms full pipeline, about 105 MB resident with models
-loaded. No GPU, no cloud, no telemetry.
+Under the hood there are four small pieces — a root daemon that owns
+the cameras, a PAM module, a little session agent that shows the
+prompt, and `zdrctl` for enrollment. The matching itself is YuNet +
+SFace over ONNX, checked on both the normal webcam **and** the IR
+camera. That second sensor matters: when I tested, a printed photo
+and a phone photo both sailed through the RGB camera and both got
+rejected by IR, which couldn't even find a face on them.
 
-## Design rules
+## What you need
 
-- **Consent before capture, always.** The camera light never turns on
-  for a request you have not seen. A background process running
-  `sudo` gets a prompt on your screen, not your face.
-- **Two sensors or it does not count.** A phone or printed photo
-  passes RGB matching easily (measured) and fails the IR sensor.
-  Both must see one face, at the same time.
-- **Per-user templates.** A request for user A is only ever compared
-  against A's templates. Unknown users fail closed.
-- **The password is the floor.** Face auth is a convenience path in
-  front of `pam_unix`, never a replacement and never the only way in.
-- **Embeddings, not photos.** The template store holds floats, under
-  `/var/lib/zdr/<user>/`, root-owned, mode `0600`.
+- A Linux box with PAM and systemd — developed on Arch, packaged for
+  it, with Debian/RHEL PAM fragments in the tree.
+- A normal webcam, and ideally an IR camera (the Windows Hello kind,
+  showing up as a greyscale V4L2 device). RGB-only mode exists, but
+  read the honesty section below before enabling it.
+- Optionally a TPM 2.0, if you want your keyring/KeePass database to
+  unlock after a face login (more in the guide).
 
-## Requirements
+## Get it running
 
-- Linux with PAM, systemd, and a system D-Bus.
-- A webcam (RGB) and, for the real security story, a dedicated IR
-  camera exposing a `GREY` V4L2 format — the Windows Hello class of
-  hardware. Without IR, `require_ir = false` enables an RGB-only mode
-  that photos defeat; the daemon, config, and enrollment all warn
-  loudly if you turn it on.
-- Optional: TPM 2.0 for the sealed-password mode below.
-
-## Quick start (Arch)
-
-Full walk-through, including testing and recovery, is in
-[`docs/manual-setup.md`](docs/manual-setup.md). The short form:
+The full walk-through — install, enroll, test safely, then wire up
+`sudo` and polkit — lives in
+[`docs/manual-setup.md`](docs/manual-setup.md). Please actually
+follow the "test first, root shell open" part; PAM files are the one
+place where a typo can ruin your afternoon. The short version:
 
 ```sh
 cd packaging/arch && makepkg -si
 sudo systemctl enable --now zdrd.service
-sudo zdrctl enroll          # five guided captures
-# test against a throwaway PAM service first, root shell open:
-sudo pamtester -v zdr-test $USER authenticate
+sudo zdrctl enroll
 ```
 
-Then add one line as the first auth line of `/etc/pam.d/sudo`:
+If you want the guts — the consent protocol, the D-Bus contract, why
+things are the way they are — that's
+[`docs/architecture.md`](docs/architecture.md).
 
-```text
-auth sufficient pam_zdr.so
-```
+## Honest limits
 
-Debian/Ubuntu and Fedora/RHEL use their PAM profile systems instead
-of hand edits; see [`packaging/README.md`](packaging/README.md).
-
-## Configuration
-
-`/etc/zdr/zdrd.toml` (CLI flags override it):
-
-- `rgb_camera`, `ir_camera` — device paths; absent or `"auto"` means
-  detect by V4L2 format scan at startup.
-- `require_ir` — default `true`. `false` is the RGB-only downgrade.
-- `threshold` — cosine match bar, default `0.363`. Single-user
-  machines should raise it (the author runs `0.6`; his live scores
-  sit above 0.95).
-- `auth_dir`, `yunet`, `sface` — store and model paths.
-- `tpm_pcrs` — PCR binding for the sealed password, default `"7"`.
-
-An annotated example ships as `zdrd/zdrd.toml.example` and installs
-as `/etc/zdr/zdrd.toml` from the Arch package.
-
-## The authtok mode (keyring-friendly logins)
-
-`sudo zdrctl enroll-password` seals your login password with
-`systemd-creds` against the TPM. With the module placed as
-
-```text
-auth [success=ignore default=ignore] pam_zdr.so mode=authtok quiet
-auth required pam_unix.so try_first_pass
-```
-
-a face match releases the sealed password into `PAM_AUTHTOK`,
-`pam_unix` validates it, and token consumers (KeePass daemons,
-keyrings) unlock exactly as after a typed login. In this mode a face
-match never authenticates by itself. `quiet` suppresses the PAM info
-message that would make modal polkit agents (e.g. Noctalia's panel)
-cover the consent popup.
-
-## Repository layout
-
-| Path | Contents |
-|---|---|
-| `zdrd/` | The daemon and `zdrctl`. |
-| `pam-zdr/` | The PAM module (`pam_zdr.so`). |
-| `zdr-agent/` | The session consent agent and the QtQuick prompt (themeable; reads Noctalia's palette when present). Prompt backends are pluggable. |
-| `dbus-1/` | The system-bus policy for `org.zdr.Authenticator`. |
-| `packaging/` | Arch `PKGBUILD`, Debian `pam-auth-update` profile, RHEL authselect guidance. |
-| `docs/` | The manual setup guide. |
-| `spike/` | The Phase 0 engine benchmark that selected YuNet + SFace. Historical; still handy for capturing enrollment photos. |
-| `data/` | Legacy dlib models from the project's first incarnation. Unused by current code. |
+- This authenticates *a live face sufficiently like yours, with your
+  consent*. A close lookalike or an identical twin should be assumed
+  to pass. Strangers and photographs don't.
+- RGB-only mode is a convenience feature, not security. A phone
+  photo beats it. The daemon will shout about this in the logs, and
+  it's saying it here too.
+- It's experimental security software that I happen to use every
+  day. No audit, no warranty, and the password fallback is always
+  there by design — zdr is a faster door, not the only door.
 
 ## Building from source
 
@@ -146,34 +85,18 @@ cargo build --release --workspace
 cargo test --workspace
 ```
 
-The `ort` crate downloads a prebuilt ONNX Runtime at build time, and
-the model files come from the OpenCV zoo (the Arch package fetches
-them as checked sources; `spike/scripts/download-models.sh` does the
-same for manual builds). The optional QtQuick prompt host
-(`zdr-agent/prompt/main.cpp`) needs Qt 6 Quick; without it the agent
-falls back to `qml6` or desktop-notification actions.
-
-## Security summary
-
-zdr authenticates *a live face sufficiently like yours, with explicit
-consent, in front of two sensors*. That is strong against photos,
-screens, strangers, and unattended auth requests. It is not a depth
-sensor, it has no certified anti-spoofing, and a close lookalike —
-above all an identical twin — should be assumed able to pass. Face
-data never leaves the machine. If that threat model does not fit
-yours, keep the password and treat this as a very polite doorbell.
+Models aren't vendored; the packaging fetches them from the OpenCV
+zoo with pinned hashes. The QtQuick prompt is optional — without Qt
+the agent falls back to a script run or notification buttons.
 
 ## Thanks
 
-- [YuNet](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet)
-  and [SFace](https://github.com/opencv/opencv_zoo/tree/main/models/face_recognition_sface)
-  from the OpenCV zoo, for small, fast, permissively licensed models.
-- [`ort`](https://github.com/pykeio/ort), the ONNX Runtime bindings.
-- [`zbus`](https://github.com/dbus2/zbus), for the D-Bus API.
-- [`pam-bindings`](https://crates.io/crates/pam-bindings) — used with
-  care, and with one hard-won workaround documented in the source.
+YuNet and SFace from the OpenCV zoo for being small, fast, and
+permissively licensed; `ort` for painless ONNX Runtime from Rust;
+`zbus` for the D-Bus API; and `pam-bindings`, which taught me a
+memorable lesson about reading the source of your dependencies
+(it's documented in ours, with love).
 
 ## License
 
-MIT. The model files carry their own licenses (YuNet MIT, SFace
-Apache-2.0) and are downloaded, never vendored.
+MIT. Models keep their own licenses (YuNet MIT, SFace Apache-2.0).
