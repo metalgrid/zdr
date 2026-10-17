@@ -1,6 +1,6 @@
-# Maintainer: iso
-# Personal package: builds the committed master tree of the local zdr repo.
-# Commit your changes before rebuilding, or makepkg will not see them.
+# Maintainer: metalgrid
+# Builds the master branch from GitHub. For local development builds,
+# point the source at your checkout: git+file:///path/to/zdr#branch=master
 pkgname=zdr
 pkgver=0.1.0
 pkgrel=1
@@ -15,7 +15,7 @@ optdepends=('qt6-declarative: QtQuick consent prompt'
             'v4l-utils: camera inspection'
             'pamtester: test the PAM stack before enabling it')
 install=zdr.install
-source=("$pkgname::git+file:///path/to/zdr#branch=master"
+source=("$pkgname::git+https://github.com/metalgrid/zdr.git#branch=master"
         "face_detection_yunet_2023mar.onnx::https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
         "face_recognition_sface_2021dec.onnx::https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx")
 sha256sums=('SKIP'

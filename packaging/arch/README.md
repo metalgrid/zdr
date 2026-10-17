@@ -1,15 +1,19 @@
 # Arch package
 
-Builds `zdrd`, `pam_zdr.so`, and `zdr-agent` from the committed `master`
-tree of this repo, and installs the YuNet and SFace models.
+Builds `zdrd`, `pam_zdr.so`, and `zdr-agent` from the `master` branch
+on GitHub, and installs the YuNet and SFace models.
 
 ## Build and install
 
 ```sh
-git -C /path/to/zdr commit -am "your changes"   # makepkg builds committed code only
 cd packaging/arch
 makepkg -si
 ```
+
+For local development builds, makepkg builds committed code only.
+Point the PKGBUILD `source` at your checkout
+(`git+file:///path/to/zdr#branch=master`), commit your changes, then
+build as above.
 
 The build needs network access. Cargo downloads crates, and the `ort`
 crate downloads a prebuilt ONNX Runtime.
