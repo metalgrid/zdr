@@ -54,6 +54,7 @@ impl PamHooks for PamZdr {
             Ok(mode) => mode,
             Err(value) => return fail("module arguments", &format!("unknown mode {value:?}")),
         };
+        let quiet = parse_quiet(&args);
 
         // Do NOT use PamHandle::get_user from pam-bindings 0.1.1: it passes
         // an immutable local's address to pam_get_user, which is UB. In
@@ -104,11 +105,18 @@ impl PamHooks for PamZdr {
             "agent" => {
                 // Best-effort hint; the GUI popup is the real prompt. A
                 // missing/failing conversation must not block approval.
-                if let Ok(Some(conv)) = pamh.get_item::<Conv>() {
-                    let _ = conv.send(
-                        PAM_TEXT_INFO,
-                        "Face authentication: approve in the popup\u{2026}",
-                    );
+                // With `quiet`, send nothing: some agents (Noctalia's
+                // polkit panel) open a system modal on the first
+                // conversation message, covering our consent popup.
+                // Silence keeps the popup the only surface; the agent
+                // still appears later if a password is needed.
+                if !quiet {
+                    if let Ok(Some(conv)) = pamh.get_item::<Conv>() {
+                        let _ = conv.send(
+                            PAM_TEXT_INFO,
+                            "Face authentication: approve in the popup\u{2026}",
+                        );
+                    }
                 }
                 match call_await_consent(&connection, &request_id) {
                     Ok(outcome) => match parse_outcome(&outcome) {
@@ -472,6 +480,13 @@ pub(crate) enum Mode {
 /// `mode=` appears more than once the last occurrence wins. An unknown
 /// value is an error: the caller logs it and fails closed with
 /// `PAM_AUTH_ERR` rather than guessing a mode.
+/// Parse the `quiet` module argument. Pure. Presence (exact token
+/// `quiet`) suppresses the agent-channel PAM_TEXT_INFO hint; see the
+/// agent branch for why modal polkit agents need that.
+pub(crate) fn parse_quiet(args: &[&CStr]) -> bool {
+    args.iter().any(|arg| arg.to_string_lossy() == "quiet")
+}
+
 pub(crate) fn parse_mode(args: &[&CStr]) -> Result<Mode, String> {
     let mut mode = Mode::Decide;
     for arg in args {
@@ -712,6 +727,24 @@ mod tests {
             PamResultCode::PAM_AUTH_ERR
         );
         assert_eq!(decide(&Consent::Expired, None), PamResultCode::PAM_AUTH_ERR);
+    }
+
+    fn quiet_of(args: &[&str]) -> bool {
+        let owned: Vec<std::ffi::CString> = args
+            .iter()
+            .map(|a| std::ffi::CString::new(*a).unwrap_or_default())
+            .collect();
+        let refs: Vec<&CStr> = owned.iter().map(|a| a.as_c_str()).collect();
+        parse_quiet(&refs)
+    }
+
+    #[test]
+    fn quiet_requires_the_exact_token() {
+        assert!(!quiet_of(&[]));
+        assert!(quiet_of(&["quiet"]));
+        assert!(quiet_of(&["mode=decide", "quiet"]));
+        assert!(!quiet_of(&["quiet=1"]));
+        assert!(!quiet_of(&["Quiet"]));
     }
 
     fn mode_of(args: &[&str]) -> Result<Mode, String> {
