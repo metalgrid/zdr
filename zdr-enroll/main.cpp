@@ -18,6 +18,15 @@
 //           rgb_png:ay, ir_png:ay)
 //   FinishEnroll(enroll_id:s) -> (stored:i)
 //   CancelEnroll(enroll_id:s) -> ()
+//   TemplateInfo() -> (count:i, mode:s, has_sealed:b)
+//       Describes the caller (daemon derives the user from the
+//       caller's uid); mode is ir, rgb, or none.
+//   VerifySelf() -> (matched:b, reason:s, best:d,
+//                    rgb_png:ay, ir_png:ay)
+//       One capture scored against the caller's own templates;
+//       reason is match, nomatch, noface-ir, noface-rgb, camera,
+//       or engine; AuthFeedback during it uses request_id
+//       'self-test'.
 //   signal AuthFeedback(request_id:s, kind:s, message:s)
 //
 // Every D-Bus call is asynchronous (QDBusConnection::asyncCall +
@@ -185,6 +194,14 @@ class EnrollBackend : public QObject
     Q_PROPERTY(bool hasCapture READ hasCapture NOTIFY stateChanged)
     Q_PROPERTY(int stored READ stored NOTIFY stateChanged)
     Q_PROPERTY(QString errorMessage READ errorMessage NOTIFY stateChanged)
+    Q_PROPERTY(bool statusKnown READ statusKnown NOTIFY stateChanged)
+    Q_PROPERTY(int templateCount READ templateCount NOTIFY stateChanged)
+    Q_PROPERTY(QString templateMode READ templateMode NOTIFY stateChanged)
+    Q_PROPERTY(bool hasSealed READ hasSealed NOTIFY stateChanged)
+    Q_PROPERTY(bool testMatched READ testMatched NOTIFY stateChanged)
+    Q_PROPERTY(QString testReason READ testReason NOTIFY stateChanged)
+    Q_PROPERTY(double testBest READ testBest NOTIFY stateChanged)
+    Q_PROPERTY(QString testResultText READ testResultText NOTIFY stateChanged)
 
 public:
     explicit EnrollBackend(PreviewImageProvider *previews, QObject *parent = nullptr)
@@ -200,6 +217,9 @@ public:
                         QStringLiteral("AuthFeedback"),
                         this, SLOT(onAuthFeedback(QString,QString,QString)));
         }
+        // The start screen is a status screen: ask the daemon who
+        // (if anyone) this caller already is, without blocking.
+        QTimer::singleShot(0, this, [this]() { refreshStatus(); });
     }
 
     QString username() const { return m_username; }
@@ -215,6 +235,14 @@ public:
     bool hasCapture() const { return m_hasCapture; }
     int stored() const { return m_stored; }
     QString errorMessage() const { return m_errorMessage; }
+    bool statusKnown() const { return m_statusKnown; }
+    int templateCount() const { return m_templateCount; }
+    QString templateMode() const { return m_templateMode; }
+    bool hasSealed() const { return m_hasSealed; }
+    bool testMatched() const { return m_testMatched; }
+    QString testReason() const { return m_testReason; }
+    double testBest() const { return m_testBest; }
+    QString testResultText() const { return m_testResultText; }
 
     // zdrctl wording (zdrd/src/bin/zdrctl.rs `guidance`).
     static QString guidanceForKind(const QString &kind)
@@ -240,6 +268,162 @@ public:
         if (kind == QStringLiteral("error"))
             return QStringLiteral("Capture failed — check the camera and try again.");
         return QStringLiteral("Try again.");
+    }
+
+    // Wording for a VerifySelf reason, reusing the guidance line
+    // vocabulary above wherever a reason maps onto it.
+    static QString reasonGuidance(const QString &reason)
+    {
+        if (reason == QStringLiteral("match"))
+            return guidanceForKind(QStringLiteral("matched"));
+        if (reason == QStringLiteral("nomatch"))
+            return QStringLiteral(
+                "below the match threshold \u2014 face the camera in good light and try again.");
+        if (reason == QStringLiteral("noface-ir") || reason == QStringLiteral("noface-rgb"))
+            return guidanceForKind(QStringLiteral("no-face"));
+        // camera / engine (and anything new the daemon adds)
+        return guidanceForKind(QStringLiteral("error"));
+    }
+
+    // Ask the daemon for the caller's enrollment status. Used on
+    // launch, on return to the status screen, and after a
+    // successful FinishEnroll so counts stay truthful. A failure
+    // lands on the error panel, except over the success panel,
+    // where enrollment already succeeded and a stale count is
+    // better than contradicting it.
+    Q_INVOKABLE void refreshStatus()
+    {
+        if (m_busy || m_statusInFlight)
+            return;
+        QDBusConnection bus = QDBusConnection::systemBus();
+        if (!bus.isConnected()) {
+            fail(QStringLiteral(
+                "Cannot connect to the system bus. This app needs a "
+                "running desktop session with D-Bus, then try again."));
+            return;
+        }
+        m_statusInFlight = true;
+        m_busy = true;
+        m_errorMessage.clear();
+        emit stateChanged();
+
+        QDBusMessage msg = QDBusMessage::createMethodCall(
+            kService, kPath, kInterface, QStringLiteral("TemplateInfo"));
+        auto *watcher = new QDBusPendingCallWatcher(bus.asyncCall(msg, kDbusTimeoutMs), this);
+        connect(watcher, &QDBusPendingCallWatcher::finished, this,
+                [this, watcher]() {
+                    watcher->deleteLater();
+                    QDBusPendingReply<int, QString, bool> reply = *watcher;
+                    m_statusInFlight = false;
+                    m_busy = false;
+                    if (reply.isError()) {
+                        if (m_phase == QStringLiteral("success")) {
+                            emit stateChanged();
+                            return;
+                        }
+                        fail(friendlyError(reply.error(), QStringLiteral("Checking enrollment status")));
+                        return;
+                    }
+                    m_templateCount = reply.argumentAt<0>();
+                    m_templateMode = reply.argumentAt<1>();
+                    m_hasSealed = reply.argumentAt<2>();
+                    m_statusKnown = true;
+                    if (m_phase == QStringLiteral("loading")
+                        || m_phase == QStringLiteral("idle")
+                        || m_phase == QStringLiteral("error")) {
+                        m_phase = QStringLiteral("idle");
+                        setGuidance(m_templateCount > 0
+                                        ? QStringLiteral("You are already enrolled.")
+                                        : QStringLiteral("Not enrolled yet."),
+                                    QString());
+                    }
+                    emit stateChanged();
+                });
+    }
+
+    // One VerifySelf capture against the caller's own templates,
+    // from the status screen, the success panel, or Test again.
+    Q_INVOKABLE void verifySelf()
+    {
+        if (m_busy || !m_enrollId.isEmpty())
+            return;
+        if (m_phase != QStringLiteral("idle") && m_phase != QStringLiteral("success")
+            && m_phase != QStringLiteral("test-result"))
+            return;
+        QDBusConnection bus = QDBusConnection::systemBus();
+        if (!bus.isConnected()) {
+            fail(QStringLiteral("Lost the connection to the system bus. The test did not run."));
+            return;
+        }
+        m_phase = QStringLiteral("testing");
+        m_busy = true;
+        m_testInFlight = true;
+        m_testMatched = false;
+        m_testReason.clear();
+        m_testBest = 0.0;
+        m_testResultText.clear();
+        const int generation = ++m_testGeneration;
+        if (m_previews)
+            m_previews->clear();
+        m_hasCapture = false;
+        ++m_previewVersion;
+        m_rgbSource.clear();
+        m_irSource.clear();
+        setGuidance(guidanceForKind(QStringLiteral("capturing")), QStringLiteral("capturing"));
+        emit stateChanged();
+
+        QDBusMessage msg = QDBusMessage::createMethodCall(
+            kService, kPath, kInterface, QStringLiteral("VerifySelf"));
+        auto *watcher = new QDBusPendingCallWatcher(bus.asyncCall(msg, kDbusTimeoutMs), this);
+        connect(watcher, &QDBusPendingCallWatcher::finished, this,
+                [this, watcher, generation]() {
+                    watcher->deleteLater();
+                    // Cancelled/reset while the capture was in flight.
+                    if (generation != m_testGeneration)
+                        return;
+                    QDBusPendingReply<bool, QString, double, QByteArray, QByteArray> reply = *watcher;
+                    m_busy = false;
+                    m_testInFlight = false;
+                    if (reply.isError()) {
+                        fail(friendlyError(reply.error(), QStringLiteral("Testing your face")));
+                        return;
+                    }
+                    m_testMatched = reply.argumentAt<0>();
+                    m_testReason = reply.argumentAt<1>();
+                    m_testBest = reply.argumentAt<2>();
+                    updatePreview(QStringLiteral("rgb"), reply.argumentAt<3>());
+                    updatePreview(QStringLiteral("ir"), reply.argumentAt<4>());
+                    const QString score = QString::number(m_testBest, 'f', 2);
+                    if (m_testMatched) {
+                        m_testResultText = QStringLiteral("Matched \u2014 score ") + score;
+                        setGuidance(reasonGuidance(m_testReason), QStringLiteral("matched"));
+                    } else if (m_testReason == QStringLiteral("nomatch")) {
+                        m_testResultText = QStringLiteral("Not matched \u2014 best score ") + score
+                            + QStringLiteral(" (") + reasonGuidance(m_testReason) + QStringLiteral(")");
+                        setGuidance(reasonGuidance(m_testReason), QStringLiteral("not-matched"));
+                    } else {
+                        m_testResultText = QStringLiteral("Not matched \u2014 ") + reasonGuidance(m_testReason);
+                        setGuidance(reasonGuidance(m_testReason),
+                                    m_testReason.startsWith(QStringLiteral("noface"))
+                                        ? QStringLiteral("no-face")
+                                        : QStringLiteral("error"));
+                    }
+                    m_phase = QStringLiteral("test-result");
+                    emit stateChanged();
+                });
+    }
+
+    // Back from the test flow: show the status screen again and
+    // re-query it so the counts shown are current.
+    Q_INVOKABLE void backToStatus()
+    {
+        if (m_busy)
+            return;
+        m_phase = QStringLiteral("idle");
+        m_testResultText.clear();
+        setGuidance(QStringLiteral("Checking your enrollment status\u2026"), QString());
+        emit stateChanged();
+        refreshStatus();
     }
 
     Q_INVOKABLE void beginEnroll()
@@ -377,6 +561,9 @@ public:
                     m_phase = QStringLiteral("success");
                     setGuidance(QStringLiteral("Enrollment complete."), QStringLiteral("stored"));
                     emit stateChanged();
+                    // Counts on the status screen must reflect
+                    // what was just stored.
+                    refreshStatus();
                 });
     }
 
@@ -385,6 +572,11 @@ public:
     // session id is dropped immediately so it is idempotent.
     Q_INVOKABLE void cancelSession()
     {
+        // A VerifySelf capture cannot be cancelled daemon-side;
+        // dropping the generation makes its late reply a no-op.
+        ++m_testGeneration;
+        m_testInFlight = false;
+        m_statusInFlight = false;
         const QString enrollId = m_enrollId;
         m_enrollId.clear();
         if (!enrollId.isEmpty()) {
@@ -399,7 +591,7 @@ public:
             }
         }
         if (m_phase != QStringLiteral("success")) {
-            m_phase = QStringLiteral("idle");
+            m_phase = m_statusKnown ? QStringLiteral("idle") : QStringLiteral("loading");
             m_busy = false;
             m_captured = 0;
             m_needed = 5;
@@ -410,7 +602,7 @@ public:
     }
 
     // 'Try again' on the error panel: drop any live session
-    // (best-effort) and return to the start state.
+    // (best-effort) and re-query the caller's enrollment status.
     Q_INVOKABLE void tryAgain()
     {
         cancelSession();
@@ -421,15 +613,19 @@ public:
         m_rgbSource.clear();
         m_irSource.clear();
         m_errorMessage.clear();
-        m_phase = QStringLiteral("idle");
-        setGuidance(QStringLiteral("Press Begin to start enrollment."), QString());
+        m_statusKnown = false;
+        m_phase = QStringLiteral("loading");
+        setGuidance(QStringLiteral("Checking your enrollment status\u2026"), QString());
         emit stateChanged();
+        refreshStatus();
     }
 
 public slots:
     void onAuthFeedback(const QString &requestId, const QString &kind, const QString &message)
     {
-        if (m_enrollId.isEmpty() || requestId != m_enrollId)
+        const bool enrollFeedback = !m_enrollId.isEmpty() && requestId == m_enrollId;
+        const bool testFeedback = m_testInFlight && requestId == QStringLiteral("self-test");
+        if (!enrollFeedback && !testFeedback)
             return;
         // Prefer the zdrctl wording for known kinds; fall back to
         // the daemon's own message for anything new.
@@ -495,8 +691,8 @@ private:
     PreviewImageProvider *m_previews;
     QString m_username;
     QString m_enrollId;
-    QString m_phase = QStringLiteral("idle");
-    QString m_guidance = QStringLiteral("Press Begin to start enrollment.");
+    QString m_phase = QStringLiteral("loading");
+    QString m_guidance = QStringLiteral("Checking your enrollment status\u2026");
     QString m_guidanceKind;
     QString m_errorMessage;
     QString m_rgbSource;
@@ -508,6 +704,17 @@ private:
     bool m_busy = false;
     bool m_cooldown = false;
     bool m_hasCapture = false;
+    bool m_statusKnown = false;
+    bool m_statusInFlight = false;
+    int m_templateCount = 0;
+    QString m_templateMode = QStringLiteral("none");
+    bool m_hasSealed = false;
+    bool m_testInFlight = false;
+    int m_testGeneration = 0;
+    bool m_testMatched = false;
+    QString m_testReason;
+    double m_testBest = 0.0;
+    QString m_testResultText;
 
 signals:
     void stateChanged();

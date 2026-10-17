@@ -49,6 +49,15 @@ Window {
     property string fontFamily: "Sans Serif"
 
     property bool closeHandled: false
+    property bool confirmReenroll: false
+
+    function templateModeLabel() {
+        if (backend.templateMode === "ir")
+            return "IR";
+        if (backend.templateMode === "rgb")
+            return "RGB-only \u2014 insecure";
+        return "unknown mode";
+    }
 
     function guidanceColor(kind) {
         if (kind === "matched" || kind === "stored")
@@ -222,6 +231,8 @@ Window {
         // Five progress dots (captured / needed).
         RowLayout {
             Layout.fillWidth: true
+            visible: backend.phase === "starting" || backend.phase === "active"
+                || backend.phase === "finishing"
             spacing: 8
 
             Repeater {
@@ -259,6 +270,9 @@ Window {
         // RGB + IR previews from the latest capture stills.
         RowLayout {
             Layout.fillWidth: true
+            visible: backend.phase === "starting" || backend.phase === "active"
+                || backend.phase === "finishing" || backend.phase === "testing"
+                || backend.phase === "test-result"
             spacing: 12
 
             Rectangle {
@@ -350,6 +364,8 @@ Window {
         // AuthFeedback messages forwarded through the backend.
         Text {
             Layout.fillWidth: true
+            visible: backend.phase === "starting" || backend.phase === "active"
+                || backend.phase === "finishing" || backend.phase === "testing"
             text: backend.guidance
             color: root.guidanceColor(backend.guidanceKind)
             font.family: root.fontFamily
@@ -358,23 +374,185 @@ Window {
             horizontalAlignment: Text.AlignHCenter
         }
 
-        Text {
+        // Status screen: what the daemon says about this caller.
+        Rectangle {
             Layout.fillWidth: true
-            visible: backend.phase === "idle"
-            text: "Press Begin to start. Your desktop may then show a password "
-                + "prompt to authorize enrollment — that password goes to your "
-                + "desktop's authentication agent, not to this app. After that, "
-                + "take five good captures, turning your head slightly between them."
-            color: root.colOnSurfaceVariant
-            font.family: root.fontFamily
-            font.pixelSize: 13
-            wrapMode: Text.WordWrap
+            Layout.preferredHeight: backend.phase === "loading" ? 64 : 168
+            visible: backend.phase === "loading" || backend.phase === "idle"
+            radius: root.cornerRadius
+            color: root.colSurfaceVariant
+            border.color: root.colOutline
+            border.width: 1
+
+            ColumnLayout {
+                anchors.fill: parent
+                anchors.margins: 14
+                spacing: 6
+
+                Text {
+                    Layout.fillWidth: true
+                    visible: backend.phase === "loading"
+                    text: "Checking your enrollment status\u2026"
+                    color: root.colOnSurfaceVariant
+                    font.family: root.fontFamily
+                    font.pixelSize: 14
+                    wrapMode: Text.WordWrap
+                }
+                Text {
+                    Layout.fillWidth: true
+                    visible: backend.phase === "idle" && backend.templateCount > 0
+                    text: "You are enrolled \u2014 " + backend.templateCount
+                        + (backend.templateCount === 1 ? " template (" : " templates (")
+                        + root.templateModeLabel() + ")"
+                    color: root.colOnSurface
+                    font.family: root.fontFamily
+                    font.pixelSize: 15
+                    font.bold: true
+                    wrapMode: Text.WordWrap
+                }
+                Text {
+                    Layout.fillWidth: true
+                    visible: backend.phase === "idle" && backend.templateCount > 0
+                    text: "Sealed password: " + (backend.hasSealed ? "yes" : "no")
+                    color: root.colOnSurfaceVariant
+                    font.family: root.fontFamily
+                    font.pixelSize: 13
+                    wrapMode: Text.WordWrap
+                }
+                Text {
+                    Layout.fillWidth: true
+                    visible: backend.phase === "idle" && backend.templateCount === 0
+                    text: "Not enrolled yet"
+                    color: root.colOnSurface
+                    font.family: root.fontFamily
+                    font.pixelSize: 15
+                    font.bold: true
+                    wrapMode: Text.WordWrap
+                }
+                Text {
+                    Layout.fillWidth: true
+                    visible: backend.phase === "idle" && backend.templateCount === 0
+                    text: "Begin enrollment to take five good captures, turning "
+                        + "your head slightly between them. Your desktop may show "
+                        + "a password prompt to authorize enrollment \u2014 that "
+                        + "password goes to your desktop's authentication agent, "
+                        + "not to this app. Testing becomes available once you "
+                        + "are enrolled."
+                    color: root.colOnSurfaceVariant
+                    font.family: root.fontFamily
+                    font.pixelSize: 13
+                    wrapMode: Text.WordWrap
+                }
+            }
+        }
+
+        // In-window confirmation before a re-enrollment replaces
+        // the caller's current templates.
+        Rectangle {
+            Layout.fillWidth: true
+            Layout.preferredHeight: 132
+            visible: root.confirmReenroll && backend.phase === "idle"
+                && backend.templateCount > 0
+            radius: root.cornerRadius
+            color: root.colSurfaceVariant
+            border.color: root.colError
+            border.width: 1
+
+            ColumnLayout {
+                anchors.fill: parent
+                anchors.margins: 14
+                spacing: 8
+
+                Text {
+                    Layout.fillWidth: true
+                    text: "This replaces your current templates"
+                    color: root.colOnSurface
+                    font.family: root.fontFamily
+                    font.pixelSize: 14
+                    font.bold: true
+                    wrapMode: Text.WordWrap
+                }
+                RowLayout {
+                    spacing: 10
+
+                    Button {
+                        id: confirmReenrollButton
+                        text: "Continue"
+                        font.family: root.fontFamily
+                        font.pixelSize: 14
+                        onClicked: {
+                            root.confirmReenroll = false;
+                            backend.beginEnroll();
+                        }
+                        contentItem: Text {
+                            text: confirmReenrollButton.text
+                            color: root.colOnPrimary
+                            font: confirmReenrollButton.font
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        background: Rectangle {
+                            implicitWidth: 110
+                            implicitHeight: 36
+                            radius: root.cornerRadius
+                            color: confirmReenrollButton.hovered ? root.colHover : root.colPrimary
+                            border.color: root.colPrimary
+                            border.width: 1
+                        }
+                    }
+                    Button {
+                        id: cancelReenrollButton
+                        text: "Cancel"
+                        font.family: root.fontFamily
+                        font.pixelSize: 14
+                        onClicked: root.confirmReenroll = false
+                        contentItem: Text {
+                            text: cancelReenrollButton.text
+                            color: root.colOnSurface
+                            font: cancelReenrollButton.font
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        background: Rectangle {
+                            implicitWidth: 110
+                            implicitHeight: 36
+                            radius: root.cornerRadius
+                            color: cancelReenrollButton.hovered ? root.colHover : root.colSurfaceVariant
+                            border.color: root.colOutline
+                            border.width: 1
+                        }
+                    }
+                }
+            }
+        }
+
+        // Self-test result banner.
+        Rectangle {
+            Layout.fillWidth: true
+            Layout.preferredHeight: 64
+            visible: backend.phase === "test-result"
+            radius: root.cornerRadius
+            color: root.colSurfaceVariant
+            border.color: backend.testMatched ? root.colPrimary : root.colError
+            border.width: 1
+
+            Text {
+                anchors.fill: parent
+                anchors.margins: 14
+                text: backend.testResultText
+                color: backend.testMatched ? root.colPrimary : root.colError
+                font.family: root.fontFamily
+                font.pixelSize: 15
+                font.bold: true
+                wrapMode: Text.WordWrap
+                verticalAlignment: Text.AlignVCenter
+            }
         }
 
         // Success panel.
         Rectangle {
             Layout.fillWidth: true
-            Layout.preferredHeight: 112
+            Layout.preferredHeight: 168
             visible: backend.phase === "success"
             radius: root.cornerRadius
             color: root.colSurfaceVariant
@@ -397,12 +575,36 @@ Window {
                 }
                 Text {
                     Layout.fillWidth: true
-                    text: "Test it before relying on it, for example with:\n"
-                        + "sudo pamtester -v zdr-test " + backend.username + " authenticate"
+                    text: "You can also just try sudo in a terminal."
                     color: root.colOnSurfaceVariant
                     font.family: root.fontFamily
                     font.pixelSize: 13
                     wrapMode: Text.WordWrap
+                }
+                Button {
+                    id: successTestButton
+                    enabled: !backend.busy
+                    opacity: enabled ? 1 : 0.45
+                    text: "Test my face"
+                    font.family: root.fontFamily
+                    font.pixelSize: 14
+                    font.bold: true
+                    onClicked: backend.verifySelf()
+                    contentItem: Text {
+                        text: successTestButton.text
+                        color: root.colOnPrimary
+                        font: successTestButton.font
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    background: Rectangle {
+                        implicitWidth: 140
+                        implicitHeight: 36
+                        radius: root.cornerRadius
+                        color: successTestButton.hovered ? root.colHover : root.colPrimary
+                        border.color: root.colPrimary
+                        border.width: 1
+                    }
                 }
             }
         }
@@ -424,7 +626,7 @@ Window {
 
                 Text {
                     Layout.fillWidth: true
-                    text: "Enrollment did not complete"
+                    text: "Something did not work"
                     color: root.colError
                     font.family: root.fontFamily
                     font.pixelSize: 15
@@ -474,6 +676,8 @@ Window {
 
             Button {
                 id: cancelButton
+                visible: backend.phase === "starting" || backend.phase === "active"
+                    || backend.phase === "finishing"
                 enabled: backend.phase === "starting" || backend.phase === "active"
                     || backend.phase === "finishing"
                 opacity: enabled ? 1 : 0.45
@@ -503,15 +707,104 @@ Window {
             }
 
             Button {
-                id: beginButton
-                visible: backend.phase === "idle" || backend.phase === "starting"
-                enabled: backend.phase === "idle" && !backend.busy
+                id: testButton
+                visible: backend.phase === "idle"
+                enabled: backend.phase === "idle" && !backend.busy && backend.statusKnown
+                    && backend.templateCount > 0
                 opacity: enabled ? 1 : 0.45
-                text: "Begin"
+                text: "Test my face"
+                font.family: root.fontFamily
+                font.pixelSize: 14
+                onClicked: backend.verifySelf()
+                contentItem: Text {
+                    text: testButton.text
+                    color: root.colOnPrimary
+                    font: testButton.font
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                }
+                background: Rectangle {
+                    implicitWidth: 120
+                    implicitHeight: 38
+                    radius: root.cornerRadius
+                    color: testButton.hovered ? root.colHover : root.colPrimary
+                    border.color: root.colPrimary
+                    border.width: 1
+                }
+            }
+
+            Button {
+                id: testAgainButton
+                visible: backend.phase === "testing" || backend.phase === "test-result"
+                enabled: backend.phase === "test-result" && !backend.busy
+                opacity: enabled ? 1 : 0.45
+                text: "Test again"
                 font.family: root.fontFamily
                 font.pixelSize: 14
                 font.bold: true
-                onClicked: backend.beginEnroll()
+                onClicked: backend.verifySelf()
+                contentItem: Text {
+                    text: testAgainButton.text
+                    color: root.colOnPrimary
+                    font: testAgainButton.font
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                }
+                background: Rectangle {
+                    implicitWidth: 120
+                    implicitHeight: 38
+                    radius: root.cornerRadius
+                    color: testAgainButton.hovered ? root.colHover : root.colPrimary
+                    border.color: root.colPrimary
+                    border.width: 1
+                }
+            }
+
+            Button {
+                id: backButton
+                visible: backend.phase === "testing" || backend.phase === "test-result"
+                enabled: backend.phase === "test-result" && !backend.busy
+                opacity: enabled ? 1 : 0.45
+                text: "Back"
+                font.family: root.fontFamily
+                font.pixelSize: 14
+                onClicked: {
+                    root.confirmReenroll = false;
+                    backend.backToStatus();
+                }
+                contentItem: Text {
+                    text: backButton.text
+                    color: root.colOnSurface
+                    font: backButton.font
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                }
+                background: Rectangle {
+                    implicitWidth: 96
+                    implicitHeight: 38
+                    radius: root.cornerRadius
+                    color: backButton.hovered ? root.colHover : root.colSurfaceVariant
+                    border.color: root.colOutline
+                    border.width: 1
+                }
+            }
+
+            Button {
+                id: beginButton
+                visible: backend.phase === "idle" || backend.phase === "starting"
+                enabled: backend.phase === "idle" && !backend.busy && backend.statusKnown
+                opacity: enabled ? 1 : 0.45
+                text: backend.templateCount > 0 ? "Re-enroll (replaces current templates)"
+                    : "Begin enrollment"
+                font.family: root.fontFamily
+                font.pixelSize: 14
+                font.bold: true
+                onClicked: {
+                    if (backend.templateCount > 0)
+                        root.confirmReenroll = true;
+                    else
+                        backend.beginEnroll();
+                }
                 contentItem: Text {
                     text: beginButton.text
                     color: root.colOnPrimary
@@ -520,7 +813,7 @@ Window {
                     verticalAlignment: Text.AlignVCenter
                 }
                 background: Rectangle {
-                    implicitWidth: 120
+                    implicitWidth: backend.templateCount > 0 ? 300 : 160
                     implicitHeight: 38
                     radius: root.cornerRadius
                     color: beginButton.hovered ? root.colHover : root.colPrimary
