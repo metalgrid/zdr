@@ -10,9 +10,22 @@ password prompt, or a camera capture) takes its time.
 
 ## The flow
 
-1. The window shows who is being enrolled (the username comes
-   from `getpwuid(getuid())` in C++, never from `$USER` alone).
-2. **Begin** — the app calls `BeginEnroll(user)`. For a non-root
+1. The window shows who is using it (the username comes from
+   `getpwuid(getuid())` in C++, never from `$USER` alone), then
+   asks the daemon for that caller's status with `TemplateInfo()`.
+   The start screen is a status screen:
+   - Already enrolled: "You are enrolled — N templates (IR)"
+     (or "RGB-only — insecure" for RGB templates), whether a
+     sealed password is stored ("Sealed password: yes/no"), and
+     **Test my face** / **Re-enroll (replaces current templates)**
+     buttons. Re-enroll first asks in-window for confirmation
+     ("This replaces your current templates", Continue/Cancel).
+   - Not enrolled: "Not enrolled yet" and a **Begin enrollment**
+     button; **Test my face** is disabled, with a note that
+     testing becomes available once enrolled.
+   - Daemon unreachable: the plain-language error panel, whose
+     **Try again** re-queries `TemplateInfo()`.
+2. **Begin enrollment** — the app calls `BeginEnroll(user)`. For a non-root
    caller enrolling themselves, the daemon runs a polkit
    `CheckAuthorization` with user interaction, so your desktop's
    authentication agent may show a password prompt. That password
@@ -32,14 +45,27 @@ password prompt, or a camera capture) takes its time.
    `request_id == enroll_id` also update the guidance line during
    a capture.
 4. **Finish** — when a capture returns state `ready`, the app
-   automatically calls `FinishEnroll` and shows a success panel:
-   how many templates were stored, plus a hint to test with
-   `sudo pamtester` (e.g. `sudo pamtester -v zdr-test $USER authenticate`,
-   with the service name your PAM setup uses) before relying on it.
-5. **Cancel** (or closing the window) calls `CancelEnroll`
-   best-effort and returns to the start state. Any error — polkit
-   denied, daemon absent, camera error — lands on an error panel
-   with a **Try again** button that does the same.
+   automatically calls `FinishEnroll`, refreshes `TemplateInfo()`,
+   and shows a success panel: how many templates were stored, a
+   **Test my face** button (the test flow below), and one line:
+   "You can also just try sudo in a terminal."
+5. **Test my face** — from the status screen or the success
+   panel, this calls `VerifySelf()`: one capture scored against
+   your own templates. The returned RGB/IR stills appear in the
+   preview panes, `AuthFeedback` lines with request_id
+   `self-test` update the guidance line during the capture, and
+   the result banner reads e.g. "Matched — score 0.94" (primary
+   colour) or "Not matched — best score 0.21 (…)" (error colour,
+   with the reason's guidance wording when the reason is not
+   `nomatch`). **Test again** re-runs the capture; **Back**
+   returns to the status screen and refreshes `TemplateInfo()`.
+   The test button is disabled while a call is in flight, like
+   Capture.
+6. **Cancel** (or closing the window) calls `CancelEnroll`
+   best-effort and returns to the status screen. Any error —
+   polkit denied, daemon absent, camera error — lands on an
+   error panel with a **Try again** button that re-queries
+   `TemplateInfo()`.
 
 ## Build and run (development)
 
@@ -100,7 +126,9 @@ interface `org.zdr.Authenticator`:
 | `EnrollCaptureWithPreview` | `enroll_id:s -> state:s, captured:i, needed:i, kind:s, rgb_png:ay, ir_png:ay` | `state` ∈ {`captured`, `rejected`, `ready`}; `kind` ∈ {`capturing`, `no-face`, `multiple-faces`, `too-dark`, `too-bright`, `duplicate-pose`, `matched`, `not-matched`, `stored`, `error`}. PNG arrays may be empty on camera error. |
 | `FinishEnroll` | `enroll_id:s -> stored:i` | Called automatically when a capture returns `ready`. |
 | `CancelEnroll` | `enroll_id:s -> ()` | Best-effort on Cancel, Try again, and window close. |
-| `AuthFeedback` (signal) | `request_id:s, kind:s, message:s` | During enrollment `request_id` is the `enroll_id`; drives the guidance line. Other request ids are ignored. |
+| `TemplateInfo` | `() -> count:i, mode:s, has_sealed:b` | Describes the caller (the daemon derives the user from the caller's uid; no arguments). `mode` ∈ {`ir`, `rgb`, `none`}. Queried on launch, after a successful `FinishEnroll`, and whenever the status screen is returned to. |
+| `VerifySelf` | `() -> matched:b, reason:s, best:d, rgb_png:ay, ir_png:ay` | One capture scored against the caller's own templates. `reason` ∈ {`match`, `nomatch`, `noface-ir`, `noface-rgb`, `camera`, `engine`}; `best` is the cosine score (0.0 when not computed). PNG arrays may be empty. Async with the same 120 s timeout. |
+| `AuthFeedback` (signal) | `request_id:s, kind:s, message:s` | During enrollment `request_id` is the `enroll_id`; during a self-test it is `self-test`; both drive the guidance line. Other request ids are ignored. |
 
 ## Packaging note
 
