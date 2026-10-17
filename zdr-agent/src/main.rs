@@ -469,6 +469,33 @@ fn run_session(own_username: &str) -> zbus::Result<()> {
     let active = ActivePrompt::default();
     spawn_feedback_thread(connection.clone(), active.clone());
 
+    // Registration lives in daemon memory: a zdrd restart forgets us
+    // silently (our bus connection survives, so nothing here errors),
+    // and requests then fall back to the terminal channel. Re-register
+    // on a heartbeat; the daemon replaces the same-uid entry, so this
+    // is idempotent and self-heals within one interval.
+    {
+        let heartbeat_conn = connection.clone();
+        std::thread::Builder::new()
+            .name("zdr-agent-register-heartbeat".to_string())
+            .spawn(move || {
+                let proxy = match AuthenticatorProxyBlocking::new(&heartbeat_conn) {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                while !shutdown_requested() {
+                    std::thread::sleep(Duration::from_secs(20));
+                    if shutdown_requested() {
+                        break;
+                    }
+                    if proxy.register_agent().is_err() {
+                        break; // connection is gone; the session loop handles reconnect
+                    }
+                }
+            })
+            .ok();
+    }
+
     eprintln!(
         "zdr-agent: registered with org.zdr.Authenticator as {} (uid {}, user {})",
         connection
