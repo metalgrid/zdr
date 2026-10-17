@@ -11,7 +11,10 @@
 //!    "camera","engine"}
 //! - `Cancel(request_id) -> ()`
 //! - `BeginEnroll(user) -> (enroll_id)`, `EnrollCapture(enroll_id) ->
-//!   (state, captured, needed, kind)`, `FinishEnroll(enroll_id) ->
+//!   (state, captured, needed, kind)`, `EnrollCaptureWithPreview(enroll_id)
+//!   -> (state, captured, needed, kind, rgb_png, ir_png)` (same, plus
+//!   PNG stills of the frames judged in the attempt; empty on
+//!   camera/engine failure), `FinishEnroll(enroll_id) ->
 //!   (stored)`, `CancelEnroll(enroll_id) -> ()` — uid 0, or the
 //!   target user themselves after a polkit check on BeginEnroll
 //!   (action `org.zdr.Authenticator.Enroll`); a session is bound to
@@ -178,10 +181,53 @@ pub trait Verifier: Send + Sync {
         (FeedbackKind::Error, None)
     }
 
+    /// One enrollment capture plus PNG preview stills of the frames
+    /// that were judged (accepted or rejected), for GUI display.
+    /// On camera/engine failure `kind` is `error` and both stills are
+    /// empty. The default discards previews from `capture_for_enroll`;
+    /// implementors with real frames override this as the single core
+    /// and derive `capture_for_enroll` from it.
+    fn capture_for_enroll_with_preview(
+        &self,
+        existing: &[Vec<f32>],
+    ) -> EnrollCaptureOutcome {
+        let (kind, embedding) = self.capture_for_enroll(existing);
+        EnrollCaptureOutcome {
+            kind,
+            embedding,
+            rgb_png: Vec::new(),
+            ir_png: Vec::new(),
+        }
+    }
+
     /// Persist a finished enrollment and reload in-memory templates.
     /// Returns the number stored. Default: unsupported.
     fn finish_enroll_store(&self, _user: &str, _embeddings: &[Vec<f32>]) -> Result<usize, String> {
         Err("enrollment not supported by this verifier".to_string())
+    }
+}
+
+/// Result of one enrollment capture attempt: the quality-gate
+/// verdict, the embedding to store on success, and PNG preview
+/// stills of the judged frames (empty when there is nothing to
+/// show, always empty on camera/engine failure).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnrollCaptureOutcome {
+    pub kind: FeedbackKind,
+    pub embedding: Option<Vec<f32>>,
+    pub rgb_png: Vec<u8>,
+    pub ir_png: Vec<u8>,
+}
+
+impl EnrollCaptureOutcome {
+    /// Camera/engine failure: `error` kind, nothing stored, no stills.
+    pub fn error() -> Self {
+        EnrollCaptureOutcome {
+            kind: FeedbackKind::Error,
+            embedding: None,
+            rgb_png: Vec::new(),
+            ir_png: Vec::new(),
+        }
     }
 }
 
@@ -246,6 +292,105 @@ impl Authenticator {
             .check_caller(enroll_id, &who, Instant::now())
             .map_err(enroll_error)?;
         Ok(who)
+    }
+
+    /// Shared core of `EnrollCapture` / `EnrollCaptureWithPreview`:
+    /// authorize the caller, snapshot the session, run one capture on
+    /// a worker thread under the 15 s budget, and apply the verdict
+    /// to the session. The two methods differ only in whether the
+    /// preview stills are returned or discarded.
+    async fn enroll_capture_core(
+        &self,
+        enroll_id: &str,
+        header: &Header<'_>,
+        conn: &Connection,
+        emitter: &SignalEmitter<'_>,
+    ) -> Result<(String, i32, i32, String, Vec<u8>, Vec<u8>), AuthError> {
+        self.require_session_caller(conn, header, enroll_id).await?;
+        // Snapshot session state, then capture without holding the
+        // enrollment lock across blocking camera work.
+        let (user, existing, captured_before) = {
+            let mut guard = self.lock_enrollments()?;
+            let now = Instant::now();
+            match (
+                guard.user_for(enroll_id, now),
+                guard.embeddings_for(enroll_id, now),
+                guard.captured_for(enroll_id, now),
+            ) {
+                (Ok(u), Ok(e), Ok(c)) => (u, e, c),
+                (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+                    return Err(AuthError::Failed(e.to_string()))
+                }
+            }
+        };
+        // Contract result for a capture that never produced a verdict
+        // (worker spawn failure, worker death, or timeout).
+        let failed = || {
+            (
+                "rejected".to_string(),
+                captured_before as i32,
+                crate::enroll::NEEDED as i32,
+                FeedbackKind::Error.as_str().to_string(),
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+        emit_feedback(emitter, enroll_id, FeedbackKind::Capturing).await;
+        let verifier = Arc::clone(&self.verifier);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("zdrd-enroll-capture".to_string())
+            .spawn(move || {
+                let _ = tx.send(verifier.capture_for_enroll_with_preview(&existing));
+            });
+        if let Err(e) = spawned {
+            eprintln!("zdrd: EnrollCapture spawn failed for user={user}: {e}");
+            emit_feedback(emitter, enroll_id, FeedbackKind::Error).await;
+            return Ok(failed());
+        }
+        let deadline = Instant::now() + CAPTURE_TIMEOUT;
+        let outcome = loop {
+            match rx.try_recv() {
+                Ok(result) => break result,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    emit_feedback(emitter, enroll_id, FeedbackKind::Error).await;
+                    return Ok(failed());
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            if Instant::now() >= deadline {
+                eprintln!("zdrd: EnrollCapture timed out for user={user}");
+                emit_feedback(emitter, enroll_id, FeedbackKind::Error).await;
+                return Ok(failed());
+            }
+            async_io::Timer::after(Duration::from_millis(25)).await;
+        };
+        // Camera/engine failure never carries preview stills.
+        let (rgb_png, ir_png) = if outcome.kind == FeedbackKind::Error {
+            (Vec::new(), Vec::new())
+        } else {
+            (outcome.rgb_png, outcome.ir_png)
+        };
+        let attempt = self
+            .lock_enrollments()?
+            .apply_capture(enroll_id, Instant::now(), outcome.kind, outcome.embedding)
+            .map_err(|e| AuthError::Failed(e.to_string()))?;
+        emit_feedback(emitter, enroll_id, attempt.kind).await;
+        eprintln!(
+            "zdrd: EnrollCapture user={user} state={} captured={}/{} kind={}",
+            attempt.state.as_str(),
+            attempt.captured,
+            attempt.needed,
+            attempt.kind.as_str()
+        );
+        Ok((
+            attempt.state.as_str().to_string(),
+            attempt.captured as i32,
+            attempt.needed as i32,
+            attempt.kind.as_str().to_string(),
+            rgb_png,
+            ir_png,
+        ))
     }
 
     fn lock_enrollments(&self) -> Result<std::sync::MutexGuard<'_, Enrollments>, AuthError> {
@@ -839,86 +984,27 @@ impl Authenticator {
         #[zbus(connection)] conn: &Connection,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> Result<(String, i32, i32, String), AuthError> {
-        self.require_session_caller(conn, &header, enroll_id).await?;
-        // Snapshot session state, then capture without holding the
-        // enrollment lock across blocking camera work.
-        let (user, existing, captured_before) = {
-            let mut guard = self.lock_enrollments()?;
-            let now = Instant::now();
-            match (
-                guard.user_for(enroll_id, now),
-                guard.embeddings_for(enroll_id, now),
-                guard.captured_for(enroll_id, now),
-            ) {
-                (Ok(u), Ok(e), Ok(c)) => (u, e, c),
-                (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
-                    return Err(AuthError::Failed(e.to_string()))
-                }
-            }
-        };
-        emit_feedback(&emitter, enroll_id, FeedbackKind::Capturing).await;
-        let verifier = Arc::clone(&self.verifier);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let spawned = std::thread::Builder::new()
-            .name("zdrd-enroll-capture".to_string())
-            .spawn(move || {
-                let _ = tx.send(verifier.capture_for_enroll(&existing));
-            });
-        if let Err(e) = spawned {
-            eprintln!("zdrd: EnrollCapture spawn failed for user={user}: {e}");
-            emit_feedback(&emitter, enroll_id, FeedbackKind::Error).await;
-            return Ok((
-                "rejected".to_string(),
-                captured_before as i32,
-                crate::enroll::NEEDED as i32,
-                FeedbackKind::Error.as_str().to_string(),
-            ));
-        }
-        let deadline = Instant::now() + CAPTURE_TIMEOUT;
-        let (kind, embedding) = loop {
-            match rx.try_recv() {
-                Ok(result) => break result,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    emit_feedback(&emitter, enroll_id, FeedbackKind::Error).await;
-                    return Ok((
-                        "rejected".to_string(),
-                        captured_before as i32,
-                        crate::enroll::NEEDED as i32,
-                        FeedbackKind::Error.as_str().to_string(),
-                    ));
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            }
-            if Instant::now() >= deadline {
-                eprintln!("zdrd: EnrollCapture timed out for user={user}");
-                emit_feedback(&emitter, enroll_id, FeedbackKind::Error).await;
-                return Ok((
-                    "rejected".to_string(),
-                    captured_before as i32,
-                    crate::enroll::NEEDED as i32,
-                    FeedbackKind::Error.as_str().to_string(),
-                ));
-            }
-            async_io::Timer::after(Duration::from_millis(25)).await;
-        };
-        let attempt = self
-            .lock_enrollments()?
-            .apply_capture(enroll_id, Instant::now(), kind, embedding)
-            .map_err(|e| AuthError::Failed(e.to_string()))?;
-        emit_feedback(&emitter, enroll_id, attempt.kind).await;
-        eprintln!(
-            "zdrd: EnrollCapture user={user} state={} captured={}/{} kind={}",
-            attempt.state.as_str(),
-            attempt.captured,
-            attempt.needed,
-            attempt.kind.as_str()
-        );
-        Ok((
-            attempt.state.as_str().to_string(),
-            attempt.captured as i32,
-            attempt.needed as i32,
-            attempt.kind.as_str().to_string(),
-        ))
+        let (state, captured, needed, kind, _rgb_png, _ir_png) = self
+            .enroll_capture_core(enroll_id, &header, conn, &emitter)
+            .await?;
+        Ok((state, captured, needed, kind))
+    }
+
+    /// GUI variant of `EnrollCapture`: identical capture, quality
+    /// gates and session storage, plus PNG stills of the frames
+    /// judged in this attempt (accepted or rejected). On
+    /// camera/engine failure both stills are empty and kind is
+    /// `error`.
+    #[zbus(out_args("state", "captured", "needed", "kind", "rgb_png", "ir_png"))]
+    async fn enroll_capture_with_preview(
+        &self,
+        enroll_id: &str,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<(String, i32, i32, String, Vec<u8>, Vec<u8>), AuthError> {
+        self.enroll_capture_core(enroll_id, &header, conn, &emitter)
+            .await
     }
 
     #[zbus(out_args("stored"))]
@@ -1018,6 +1104,16 @@ mod tests {
                 vec![FeedbackKind::Capturing, want_terminal]
             );
         }
+    }
+
+    #[test]
+    fn enroll_preview_default_is_error_with_no_stills() {
+        // A verifier without enrollment support fails closed: error
+        // kind, no embedding, and both preview arrays empty.
+        let stub = StubVerifier(false, "camera");
+        let outcome = stub.capture_for_enroll_with_preview(&[]);
+        assert_eq!(outcome, EnrollCaptureOutcome::error());
+        assert!(outcome.rgb_png.is_empty() && outcome.ir_png.is_empty());
     }
 
     // ---- Step 15: verify_and_release (fake runner, no TPM) ----

@@ -6,7 +6,7 @@ use crate::capture::{self, gray_to_rgb};
 use crate::engine::{FaceEngine, OnnxEngine};
 use crate::error::DaemonError;
 use crate::feedback::FeedbackKind;
-use crate::service::{ScoredVerify, Verifier};
+use crate::service::{EnrollCaptureOutcome, ScoredVerify, Verifier};
 use crate::templates::TemplateStore;
 use image::{GrayImage, RgbImage};
 use std::path::PathBuf;
@@ -101,42 +101,74 @@ impl Verifier for FaceVerifier {
     }
 
     fn capture_for_enroll(&self, existing: &[Vec<f32>]) -> (FeedbackKind, Option<Vec<f32>>) {
+        let outcome = self.capture_for_enroll_with_preview(existing);
+        (outcome.kind, outcome.embedding)
+    }
+
+    /// The single enrollment-capture core: capture, run the quality
+    /// gates, and (unless the verdict is a camera/engine `error`)
+    /// PNG-encode the judged frames as preview stills. Runs on the
+    /// service layer's worker thread, so the encoding cost never
+    /// touches the bus thread.
+    fn capture_for_enroll_with_preview(
+        &self,
+        existing: &[Vec<f32>],
+    ) -> EnrollCaptureOutcome {
         let mut guard = match self.inner.lock() {
             Ok(g) => g,
-            Err(_) => return (FeedbackKind::Error, None),
+            Err(_) => return EnrollCaptureOutcome::error(),
         };
         let inner: &mut FaceInner = &mut guard;
         if inner.require_ir {
             let (rgb_path, ir_path) = match (&inner.rgb_camera, &inner.ir_camera) {
                 (Some(r), Some(i)) => (r.clone(), i.clone()),
-                _ => return (FeedbackKind::Error, None),
+                _ => return EnrollCaptureOutcome::error(),
             };
             let paired = match capture::capture_paired(&rgb_path, &ir_path) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("zdrd: enroll capture failed: {e}");
-                    return (FeedbackKind::Error, None);
+                    return EnrollCaptureOutcome::error();
                 }
             };
-            crate::enroll::evaluate_capture(
+            let (kind, embedding) = crate::enroll::evaluate_capture(
                 inner.engine.as_mut(),
                 &paired.rgb,
                 &paired.ir,
                 existing,
-            )
+            );
+            if kind == FeedbackKind::Error {
+                return EnrollCaptureOutcome::error();
+            }
+            EnrollCaptureOutcome {
+                kind,
+                embedding,
+                rgb_png: encode_png_rgb(&paired.rgb),
+                ir_png: encode_png_gray(&paired.ir),
+            }
         } else {
             let rgb_path = match &inner.rgb_camera {
                 Some(r) => r.clone(),
-                None => return (FeedbackKind::Error, None),
+                None => return EnrollCaptureOutcome::error(),
             };
             let rgb = match capture::capture_rgb(&rgb_path) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("zdrd: enroll RGB capture failed: {e}");
-                    return (FeedbackKind::Error, None);
+                    return EnrollCaptureOutcome::error();
                 }
             };
-            crate::enroll::evaluate_capture_rgb(inner.engine.as_mut(), &rgb, existing)
+            let (kind, embedding) =
+                crate::enroll::evaluate_capture_rgb(inner.engine.as_mut(), &rgb, existing);
+            if kind == FeedbackKind::Error {
+                return EnrollCaptureOutcome::error();
+            }
+            EnrollCaptureOutcome {
+                kind,
+                embedding,
+                rgb_png: encode_png_rgb(&rgb),
+                ir_png: Vec::new(),
+            }
         }
     }
 
@@ -248,6 +280,31 @@ impl Verifier for FaceVerifier {
                 }
             };
             verify_rgb_image_scored(inner.engine.as_mut(), &templates, &rgb, threshold)
+        }
+    }
+}
+
+/// PNG-encode an RGB frame for a GUI preview still. An encoding
+/// failure yields an empty still (logged), never a failed capture.
+pub fn encode_png_rgb(img: &RgbImage) -> Vec<u8> {
+    let mut buf = Vec::new();
+    match img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png) {
+        Ok(()) => buf,
+        Err(e) => {
+            eprintln!("zdrd: RGB preview PNG encode failed: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// PNG-encode an IR (grayscale) frame; see [`encode_png_rgb`].
+pub fn encode_png_gray(img: &GrayImage) -> Vec<u8> {
+    let mut buf = Vec::new();
+    match img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png) {
+        Ok(()) => buf,
+        Err(e) => {
+            eprintln!("zdrd: IR preview PNG encode failed: {e}");
+            Vec::new()
         }
     }
 }
@@ -535,6 +592,47 @@ mod tests {
             FaceVerifier::with_engine(Box::new(eng), dir.clone(), None, None, 0.363, false);
         assert_eq!(verifier.verify("alice"), (false, "nomatch".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preview_pngs_roundtrip() {
+        let rgb = RgbImage::from_fn(4, 3, |x, y| {
+            image::Rgb([(x * 40) as u8, (y * 40) as u8, 128])
+        });
+        let bytes = encode_png_rgb(&rgb);
+        assert!(bytes.starts_with(b"\x89PNG"), "must be a PNG stream");
+        let decoded = image::load_from_memory(&bytes).expect("decode rgb png");
+        assert_eq!((decoded.width(), decoded.height()), (4, 3));
+        assert_eq!(decoded.to_rgb8().get_pixel(3, 2).0, [120, 80, 128]);
+
+        let gray = GrayImage::from_fn(4, 3, |x, _| image::Luma([(x * 40) as u8]));
+        let bytes = encode_png_gray(&gray);
+        assert!(bytes.starts_with(b"\x89PNG"), "must be a PNG stream");
+        let decoded = image::load_from_memory(&bytes).expect("decode ir png");
+        assert_eq!((decoded.width(), decoded.height()), (4, 3));
+        assert_eq!(decoded.to_luma8().get_pixel(3, 0).0, [120]);
+    }
+
+    #[test]
+    fn enroll_preview_without_cameras_is_error_with_no_stills() {
+        // No camera paths configured: camera failure must report
+        // kind=error with both preview arrays empty.
+        let eng = MockEngine {
+            embedding: vec![1.0, 0.0],
+        };
+        let dir =
+            std::env::temp_dir().join(format!("zdrd-preview-test-{}", std::process::id()));
+        let verifier =
+            FaceVerifier::with_engine(Box::new(eng), dir, None, None, 0.363, true);
+        let outcome = verifier.capture_for_enroll_with_preview(&[]);
+        assert_eq!(outcome.kind, FeedbackKind::Error);
+        assert!(outcome.embedding.is_none());
+        assert!(outcome.rgb_png.is_empty() && outcome.ir_png.is_empty());
+        // The plain capture shares the same core and verdict.
+        assert_eq!(
+            verifier.capture_for_enroll(&[]),
+            (FeedbackKind::Error, None)
+        );
     }
 
     #[test]
