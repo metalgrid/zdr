@@ -21,6 +21,13 @@
 //!   the caller that began it (see `enroll.rs`/`polkit.rs`)
 //! - `ServerInfo() -> (version, require_ir)` — read-only, any uid,
 //!   no side effects (Step 14; the only contract addition)
+//! - `TemplateInfo() -> (count, mode, has_sealed)` — any uid; the
+//!   target user is derived from the caller's uid (never an
+//!   argument), mode in {"ir", "rgb", "none"}
+//! - `VerifySelf() -> (matched, reason, best, rgb_png, ir_png)` —
+//!   any uid; one scored capture against the caller's own
+//!   templates (never opened when they have none), AuthFeedback
+//!   under request_id "self-test", journal-logged every call
 //! - `EnrollPassword(user, password) -> ()` — root only (Step 15);
 //!   TPM-seals the password to `<auth-dir>/<user>/password.cred`
 //! - `HasSealedPassword(user) -> (has)` — any uid, existence only
@@ -53,6 +60,11 @@ use zbus::{interface, Connection, DBusError};
 
 /// Hard timeout around capture + inference in CaptureVerify.
 pub const CAPTURE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Fixed AuthFeedback request_id for `VerifySelf` captures: there is
+/// no consent request behind a self-test, so the GUI correlates
+/// feedback on this literal instead.
+pub const SELF_TEST_REQUEST_ID: &str = "self-test";
 
 #[derive(Debug, DBusError)]
 #[zbus(prefix = "org.zdr.Authenticator.Error", impl_display = true)]
@@ -96,6 +108,11 @@ pub struct ScoredVerify {
     pub best_cosine: Option<f32>,
     pub threshold: Option<f32>,
     pub embedding: Option<Vec<f32>>,
+    /// PNG stills of the frames judged in this capture, for
+    /// `VerifySelf` (empty on camera/engine failure, `ir_png`
+    /// empty in RGB-only mode). Other callers ignore them.
+    pub rgb_png: Vec<u8>,
+    pub ir_png: Vec<u8>,
 }
 
 impl ScoredVerify {
@@ -108,6 +125,8 @@ impl ScoredVerify {
             best_cosine: None,
             threshold: None,
             embedding: None,
+            rgb_png: Vec::new(),
+            ir_png: Vec::new(),
         }
     }
 }
@@ -461,6 +480,12 @@ fn uid_for_user(user: &str) -> Option<u32> {
         return None;
     }
     let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    uid_for_user_in(&passwd, user)
+}
+
+/// Parse the uid for `user` out of passwd-format text. A matching
+/// line with missing/non-numeric uid fields resolves to `None`.
+fn uid_for_user_in(passwd: &str, user: &str) -> Option<u32> {
     for line in passwd.lines() {
         let mut fields = line.split(':');
         if fields.next() == Some(user) {
@@ -469,6 +494,105 @@ fn uid_for_user(user: &str) -> Option<u32> {
         }
     }
     None
+}
+
+/// Inverse of [`uid_for_user`]: the login name for a caller's uid,
+/// read from /etc/passwd. This is how the self-service methods bind
+/// to the caller: the target user is never taken from an argument.
+fn user_for_uid(uid: u32) -> Option<String> {
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    user_for_uid_in(&passwd, uid)
+}
+
+/// Parse the login name for `uid` out of passwd-format text.
+/// Malformed lines (missing fields, non-numeric uid, unusable name)
+/// are skipped; an unknown uid resolves to `None`.
+fn user_for_uid_in(passwd: &str, uid: u32) -> Option<String> {
+    for line in passwd.lines() {
+        let mut fields = line.split(':');
+        let name = match fields.next() {
+            Some(name) if crate::templates::valid_user(name) => name,
+            _ => continue,
+        };
+        if fields.next().is_none() {
+            continue;
+        }
+        let entry_uid = match fields.next().and_then(|f| f.parse::<u32>().ok()) {
+            Some(entry_uid) => entry_uid,
+            None => continue,
+        };
+        if entry_uid == uid {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+/// Wire string for a stored-template mode: `"none"` exactly when
+/// there are no templates, else the store mode's own string.
+fn template_mode_str(count: usize, mode: Option<crate::templates::TemplateMode>) -> &'static str {
+    if count == 0 {
+        return "none";
+    }
+    match mode {
+        Some(m) => m.as_str(),
+        // Count without a recorded mode should not happen (v1 files
+        // load as IR); report the historical default, never "none"
+        // for a user who does have templates.
+        None => "ir",
+    }
+}
+
+/// `TemplateInfo` for `user` against the on-disk store under
+/// `auth_dir`: template count + mode, plus sealed-password
+/// existence. Pure filesystem reads; never opens a camera.
+fn template_info_for(auth_dir: &Path, user: &str) -> (i32, String, bool) {
+    let stored = crate::templates::stored_templates(auth_dir, user);
+    let count = i32::try_from(stored.count).unwrap_or(i32::MAX);
+    (
+        count,
+        template_mode_str(stored.count, stored.mode).to_string(),
+        crate::seal::has_sealed_password(auth_dir, user),
+    )
+}
+
+/// Map a scored capture onto the `VerifySelf` wire result: best
+/// cosine passthrough (0.0 when no face was scored), and stills
+/// suppressed on camera/engine failure no matter what a verifier
+/// handed back.
+fn self_result_from_scored(scored: ScoredVerify) -> (bool, String, f64, Vec<u8>, Vec<u8>) {
+    let best = scored.best_cosine.map(f64::from).unwrap_or(0.0);
+    let (rgb_png, ir_png) = if scored.reason == "camera" || scored.reason == "engine" {
+        (Vec::new(), Vec::new())
+    } else {
+        (scored.rgb_png, scored.ir_png)
+    };
+    (scored.matched, scored.reason, best, rgb_png, ir_png)
+}
+
+/// `VerifySelf` core (worker-thread body, unit-testable with a fake
+/// verifier): a user with no templates gets `(false, "nomatch",
+/// 0.0, [], [])` *without* the verifier — and therefore any camera
+/// — ever being touched. Otherwise exactly one scored capture runs
+/// through the same seam as `CaptureVerify`, feedback included.
+fn run_verify_self(
+    verifier: &dyn Verifier,
+    auth_dir: &Path,
+    user: &str,
+    feedback: &dyn Fn(FeedbackKind),
+) -> (bool, String, f64, Vec<u8>, Vec<u8>) {
+    if template_info_for(auth_dir, user).0 == 0 {
+        return (false, "nomatch".to_string(), 0.0, Vec::new(), Vec::new());
+    }
+    let scored = verifier.verify_scored_with_feedback(user, feedback);
+    self_result_from_scored(scored)
+}
+
+/// The one audit line every `VerifySelf` call leaves in the journal
+/// (the method opens cameras for non-root callers, so each call is
+/// attributable: who, whether they matched, and how well).
+fn log_verify_self(user: &str, matched: bool, best: f64) {
+    eprintln!("zdrd: VerifySelf user={user} matched={matched} best={best:.4}");
 }
 
 /// Random 128-bit request id, hex-encoded (32 chars).
@@ -570,6 +694,100 @@ impl Authenticator {
             env!("CARGO_PKG_VERSION").to_string(),
             self.verifier.require_ir(),
         )
+    }
+
+    /// Self-service template summary: callable by any uid, but only
+    /// ever describes the *caller* — the target user is derived
+    /// from the caller's uid via /etc/passwd, never from an
+    /// argument, so nobody can probe another user's enrollment.
+    /// Unknown uids (no passwd entry) are denied. Read-only.
+    #[zbus(out_args("count", "mode", "has_sealed"))]
+    async fn template_info(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] conn: &Connection,
+    ) -> Result<(i32, String, bool), AuthError> {
+        let who = caller(conn, &header).await?;
+        let user = user_for_uid(who.uid).ok_or_else(|| {
+            AuthError::AccessDenied(format!("no passwd entry for caller uid {}", who.uid))
+        })?;
+        Ok(template_info_for(&self.auth_dir, &user))
+    }
+
+    /// Self-service face test: one scored capture against the
+    /// caller's own templates, with PNG stills of the judged frames
+    /// so the enrollment GUI can show what the camera saw. The
+    /// target is derived from the caller uid exactly like
+    /// `TemplateInfo`; there is no consent request (the GUI's test
+    /// button is the consent) and no camera work at all when the
+    /// caller has no templates. Every resolved call is journal-
+    /// logged via [`log_verify_self`]; feedback is emitted under
+    /// the fixed request_id "self-test".
+    #[zbus(out_args("matched", "reason", "best", "rgb_png", "ir_png"))]
+    async fn verify_self(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<(bool, String, f64, Vec<u8>, Vec<u8>), AuthError> {
+        let who = caller(conn, &header).await?;
+        let user = user_for_uid(who.uid).ok_or_else(|| {
+            AuthError::AccessDenied(format!("no passwd entry for caller uid {}", who.uid))
+        })?;
+        // Same worker-thread + 15 s deadline pattern as CaptureVerify
+        // (no tokio APIs on the zbus executor thread). Feedback and
+        // the result share one channel so signals stay in order.
+        enum WorkerMsg {
+            Feedback(FeedbackKind),
+            Done((bool, String, f64, Vec<u8>, Vec<u8>)),
+        }
+        let verifier = Arc::clone(&self.verifier);
+        let auth_dir = self.auth_dir.clone();
+        let capture_user = user.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<WorkerMsg>();
+        let fb_tx = tx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("zdrd-verify-self".to_string())
+            .spawn(move || {
+                let feedback = |kind: FeedbackKind| {
+                    let _ = fb_tx.send(WorkerMsg::Feedback(kind));
+                };
+                let result =
+                    run_verify_self(verifier.as_ref(), &auth_dir, &capture_user, &feedback);
+                let _ = tx.send(WorkerMsg::Done(result));
+            });
+        if let Err(e) = spawned {
+            eprintln!("zdrd: VerifySelf spawn failed for user={user}: {e}");
+            emit_feedback(&emitter, SELF_TEST_REQUEST_ID, FeedbackKind::Error).await;
+            log_verify_self(&user, false, 0.0);
+            return Ok((false, "engine".to_string(), 0.0, Vec::new(), Vec::new()));
+        }
+        let deadline = Instant::now() + CAPTURE_TIMEOUT;
+        loop {
+            match rx.try_recv() {
+                Ok(WorkerMsg::Feedback(kind)) => {
+                    emit_feedback(&emitter, SELF_TEST_REQUEST_ID, kind).await;
+                }
+                Ok(WorkerMsg::Done(result)) => {
+                    log_verify_self(&user, result.0, result.2);
+                    return Ok(result);
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    eprintln!("zdrd: VerifySelf worker stopped for user={user}");
+                    emit_feedback(&emitter, SELF_TEST_REQUEST_ID, FeedbackKind::Error).await;
+                    log_verify_self(&user, false, 0.0);
+                    return Ok((false, "engine".to_string(), 0.0, Vec::new(), Vec::new()));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            if Instant::now() >= deadline {
+                eprintln!("zdrd: VerifySelf timed out for user={user}");
+                emit_feedback(&emitter, SELF_TEST_REQUEST_ID, FeedbackKind::Error).await;
+                log_verify_self(&user, false, 0.0);
+                return Ok((false, "camera".to_string(), 0.0, Vec::new(), Vec::new()));
+            }
+            async_io::Timer::after(Duration::from_millis(25)).await;
+        }
     }
 
     async fn register_agent(
@@ -1174,6 +1392,8 @@ mod tests {
             best_cosine: Some(0.9),
             threshold: Some(0.363),
             embedding: Some(vec![1.0, 0.0]),
+            rgb_png: vec![1, 2, 3],
+            ir_png: vec![4, 5],
         }
     }
 
@@ -1379,6 +1599,185 @@ mod tests {
         assert!(!matched && reason == "nomatch");
         assert!(secret.is_none());
         assert_eq!(verifier.calls(), 1, "verify must run exactly once");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Self-service: uid->name, TemplateInfo, VerifySelf ----
+
+    #[test]
+    fn user_for_uid_in_resolves_and_skips_malformed() {
+        let passwd = concat!(
+            "root:x:0:0:root:/root:/bin/bash\n",
+            "malformed-line-without-fields\n",
+            "ghost:x:not-a-uid:1001:Ghost:/home/ghost:/bin/bash\n",
+            "alice:x:1000:1000:Alice:/home/alice:/bin/bash\n",
+            ":x:1002:1002:NoName:/home/noname:/bin/bash\n",
+        );
+        // Root resolves like anyone else; malformed lines (no uid
+        // field, non-numeric uid, empty name) never match or panic.
+        assert_eq!(user_for_uid_in(passwd, 0), Some("root".to_string()));
+        assert_eq!(user_for_uid_in(passwd, 1000), Some("alice".to_string()));
+        assert_eq!(user_for_uid_in(passwd, 1001), None, "non-numeric uid skipped");
+        assert_eq!(user_for_uid_in(passwd, 1002), None, "empty name skipped");
+        assert_eq!(user_for_uid_in(passwd, 9999), None, "unknown uid");
+        assert_eq!(user_for_uid_in("", 0), None, "empty passwd");
+        // The inverse map stays consistent with uid_for_user's parser.
+        assert_eq!(uid_for_user_in(passwd, "alice"), Some(1000));
+        assert_eq!(uid_for_user_in(passwd, "ghost"), None);
+        assert_eq!(uid_for_user_in(passwd, "mallory"), None);
+    }
+
+    #[test]
+    fn template_mode_strings() {
+        use crate::templates::TemplateMode;
+        assert_eq!(template_mode_str(0, None), "none");
+        assert_eq!(template_mode_str(0, Some(TemplateMode::Ir)), "none");
+        assert_eq!(template_mode_str(0, Some(TemplateMode::Rgb)), "none");
+        assert_eq!(template_mode_str(3, Some(TemplateMode::Ir)), "ir");
+        assert_eq!(template_mode_str(1, Some(TemplateMode::Rgb)), "rgb");
+    }
+
+    fn self_test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "zdrd-selftest-{}-{}",
+            std::process::id(),
+            tag
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    fn write_templates(dir: &Path, user: &str, count: usize, mode: crate::templates::TemplateMode) {
+        let embs = vec![vec![0.5; crate::templates::EMBEDDING_DIM]; count];
+        crate::templates::write_templates_file(dir, user, &embs, mode).expect("write templates");
+    }
+
+    #[test]
+    fn template_info_for_reads_temp_store() {
+        use crate::templates::TemplateMode;
+        let dir = self_test_dir("info");
+        // No store at all: zero / none / unsealed.
+        assert_eq!(
+            template_info_for(&dir, "alice"),
+            (0, "none".to_string(), false)
+        );
+        // IR templates, then a sealed blob appears.
+        write_templates(&dir, "alice", 2, TemplateMode::Ir);
+        assert_eq!(
+            template_info_for(&dir, "alice"),
+            (2, "ir".to_string(), false)
+        );
+        std::fs::write(dir.join("alice").join("password.cred"), b"blob").expect("blob");
+        assert_eq!(
+            template_info_for(&dir, "alice"),
+            (2, "ir".to_string(), true)
+        );
+        // Re-enrolled in RGB mode: count and mode follow the store.
+        write_templates(&dir, "alice", 1, TemplateMode::Rgb);
+        assert_eq!(
+            template_info_for(&dir, "alice"),
+            (1, "rgb".to_string(), true)
+        );
+        // Another user is unaffected; a corrupt bin fails closed.
+        assert_eq!(
+            template_info_for(&dir, "bob"),
+            (0, "none".to_string(), false)
+        );
+        std::fs::create_dir_all(dir.join("bob")).expect("bob dir");
+        std::fs::write(dir.join("bob").join("templates.bin"), b"junk")
+            .expect("write corrupt bin");
+        assert_eq!(
+            template_info_for(&dir, "bob"),
+            (0, "none".to_string(), false)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_self_without_templates_never_captures() {
+        let dir = self_test_dir("notemplates");
+        // Even a verifier that *would* match must never be invoked:
+        // zero captures, no feedback, contract's empty result.
+        let verifier = CountingVerifier::new(scored_match(), Some(true));
+        let seen = RefCell::new(Vec::new());
+        let cb = |k: FeedbackKind| seen.borrow_mut().push(k);
+        let result = run_verify_self(&verifier, &dir, "alice", &cb);
+        assert_eq!(
+            result,
+            (false, "nomatch".to_string(), 0.0, Vec::new(), Vec::new())
+        );
+        assert_eq!(verifier.calls(), 0, "no templates => no capture");
+        assert!(seen.into_inner().is_empty(), "no capture => no feedback");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_self_maps_match_and_nomatch_with_best() {
+        use crate::templates::TemplateMode;
+        let dir = self_test_dir("mapping");
+        write_templates(&dir, "alice", 1, TemplateMode::Ir);
+
+        // Match: best cosine and stills pass straight through, with
+        // capturing + exactly one terminal feedback kind.
+        let verifier = CountingVerifier::new(scored_match(), Some(true));
+        let seen = RefCell::new(Vec::new());
+        let cb = |k: FeedbackKind| seen.borrow_mut().push(k);
+        let (matched, reason, best, rgb_png, ir_png) =
+            run_verify_self(&verifier, &dir, "alice", &cb);
+        assert!(matched && reason == "match");
+        assert!((best - 0.9).abs() < 1e-6, "best passthrough: {best}");
+        assert_eq!(rgb_png, vec![1, 2, 3]);
+        assert_eq!(ir_png, vec![4, 5]);
+        assert_eq!(verifier.calls(), 1, "exactly one capture");
+        assert_eq!(
+            seen.into_inner(),
+            vec![FeedbackKind::Capturing, FeedbackKind::Matched]
+        );
+
+        // Nomatch below threshold: matched/reason/best all follow
+        // the scored result, stills still describe the judged frame.
+        let mut below = scored_match();
+        below.matched = false;
+        below.reason = "nomatch".to_string();
+        below.best_cosine = Some(0.1);
+        let verifier = CountingVerifier::new(below, Some(false));
+        let seen = RefCell::new(Vec::new());
+        let cb = |k: FeedbackKind| seen.borrow_mut().push(k);
+        let (matched, reason, best, rgb_png, ir_png) =
+            run_verify_self(&verifier, &dir, "alice", &cb);
+        assert!(!matched && reason == "nomatch");
+        assert!((best - 0.1).abs() < 1e-6, "best passthrough: {best}");
+        assert_eq!(rgb_png, vec![1, 2, 3]);
+        assert_eq!(ir_png, vec![4, 5]);
+        assert_eq!(verifier.calls(), 1, "exactly one capture");
+        assert_eq!(
+            seen.into_inner(),
+            vec![FeedbackKind::Capturing, FeedbackKind::NotMatched]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_self_suppresses_stills_on_camera_or_engine_failure() {
+        use crate::templates::TemplateMode;
+        let dir = self_test_dir("failstills");
+        write_templates(&dir, "alice", 1, TemplateMode::Ir);
+        for reason in ["camera", "engine"] {
+            // A verifier that (incorrectly) hands back stills on a
+            // failure reason must not leak them onto the wire.
+            let mut failed = scored_match();
+            failed.matched = false;
+            failed.reason = reason.to_string();
+            failed.best_cosine = None;
+            let verifier = CountingVerifier::new(failed, None);
+            let (matched, got_reason, best, rgb_png, ir_png) =
+                run_verify_self(&verifier, &dir, "alice", &no_feedback);
+            assert!(!matched && got_reason == reason);
+            assert_eq!(best, 0.0, "unscored capture reports best 0.0");
+            assert!(rgb_png.is_empty() && ir_png.is_empty(), "reason {reason}");
+            assert_eq!(verifier.calls(), 1);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

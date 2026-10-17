@@ -76,6 +76,56 @@ pub fn templates_bin_path(auth_dir: &Path, user: &str) -> PathBuf {
     auth_dir.join(user).join("templates.bin")
 }
 
+/// On-disk template summary for one user: how many templates the
+/// store would load and in which sensor mode. `mode` is `None`
+/// exactly when `count` is 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredTemplates {
+    pub count: usize,
+    pub mode: Option<TemplateMode>,
+}
+
+/// Read one user's stored-template summary without an engine.
+/// Mirrors [`TemplateStore::refresh`]'s source selection:
+/// `templates.bin` is authoritative (a corrupt file fails closed
+/// with zero templates), and only when no bin exists do legacy
+/// `ir*.png` files count (as IR templates, as the PNG import in
+/// `refresh` would store them).
+pub fn stored_templates(auth_dir: &Path, user: &str) -> StoredTemplates {
+    let none = StoredTemplates {
+        count: 0,
+        mode: None,
+    };
+    if !valid_user(user) {
+        return none;
+    }
+    let bin = templates_bin_path(auth_dir, user);
+    if bin.is_file() {
+        return match load_templates_file_with_mode(&bin) {
+            Ok((mode, embs)) => StoredTemplates {
+                count: embs.len(),
+                mode: if embs.is_empty() { None } else { Some(mode) },
+            },
+            Err(e) => {
+                eprintln!(
+                    "zdrd: templates user={user}: rejecting {}: {e} (fail closed, no templates)",
+                    bin.display()
+                );
+                none
+            }
+        };
+    }
+    let count = template_files(auth_dir, user).len();
+    StoredTemplates {
+        count,
+        mode: if count > 0 {
+            Some(TemplateMode::Ir)
+        } else {
+            None
+        },
+    }
+}
+
 /// Serialize embeddings as v2 with an explicit mode byte.
 /// Every vector must be exactly EMBEDDING_DIM.
 pub fn encode_templates_with_mode(templates: &[Vec<f32>], mode: TemplateMode) -> Result<Vec<u8>> {

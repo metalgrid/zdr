@@ -260,13 +260,21 @@ impl Verifier for FaceVerifier {
                     return ScoredVerify::unscored(false, "camera".to_string());
                 }
             };
-            verify_images_scored(
+            let mut scored = verify_images_scored(
                 inner.engine.as_mut(),
                 &templates,
                 &paired.rgb,
                 &paired.ir,
                 threshold,
-            )
+            );
+            // Carry stills of the judged frames out for VerifySelf
+            // (empty on engine failure; camera failure returned
+            // above, before any frame existed).
+            if scored.reason != "engine" {
+                scored.rgb_png = encode_png_rgb(&paired.rgb);
+                scored.ir_png = encode_png_gray(&paired.ir);
+            }
+            scored
         } else {
             let rgb_path = match &inner.rgb_camera {
                 Some(r) => r.clone(),
@@ -279,7 +287,12 @@ impl Verifier for FaceVerifier {
                     return ScoredVerify::unscored(false, "camera".to_string());
                 }
             };
-            verify_rgb_image_scored(inner.engine.as_mut(), &templates, &rgb, threshold)
+            let mut scored =
+                verify_rgb_image_scored(inner.engine.as_mut(), &templates, &rgb, threshold);
+            if scored.reason != "engine" {
+                scored.rgb_png = encode_png_rgb(&rgb);
+            }
+            scored
         }
     }
 }
@@ -386,6 +399,8 @@ pub fn verify_images_scored(
         best_cosine: Some(best),
         threshold: Some(threshold),
         embedding: Some(emb.vector),
+        rgb_png: Vec::new(),
+        ir_png: Vec::new(),
     }
 }
 
@@ -453,6 +468,8 @@ pub fn verify_rgb_image_scored(
         best_cosine: Some(best),
         threshold: Some(threshold),
         embedding: Some(emb.vector),
+        rgb_png: Vec::new(),
+        ir_png: Vec::new(),
     }
 }
 
