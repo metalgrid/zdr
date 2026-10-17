@@ -24,8 +24,9 @@ Invariants first, because everything else is plumbing:
   request, which is consumed exactly once.
 - One pending request per user; 30 s TTL; a denial starts a 5 s
   cooldown; request IDs are random 128-bit hex.
-- `BeginAuth`, `AwaitConsent`, `CaptureVerify*`, `Cancel`, and the
-  enrollment methods accept uid 0 callers only. Caller identity comes
+- `BeginAuth`, `AwaitConsent`, `CaptureVerify*`, and `Cancel`
+  accept uid 0 callers only; enrollment additionally accepts the
+  polkit-authorized self path below. Caller identity comes
   from the bus daemon (`GetConnectionUnixUser` on the unique name),
   never from client-supplied fields.
 - `Respond` accepts uid 0 (the PAM terminal path) or the exact
@@ -56,7 +57,20 @@ Methods:
 | `Cancel(id)` | root | drops the request |
 | `EnrollPassword(user, password)` | root | seals to `<auth-dir>/<user>/password.cred` |
 | `HasSealedPassword(user)` | anyone | existence only |
-| `BeginEnroll(user)`, `EnrollCapture(id)`, `FinishEnroll(id)`, `CancelEnroll(id)` | root | five-capture guided enrollment |
+| `BeginEnroll(user)`, `EnrollCapture(id)`, `EnrollCaptureWithPreview(id)`, `FinishEnroll(id)`, `CancelEnroll(id)` | root, or the user themselves after a polkit check (below) | five-capture guided enrollment; the `WithPreview` variant also returns PNG stills of the judged frames |
+| `TemplateInfo()` | any uid (self only) | `(count, mode, has_sealed)` for the caller's own templates |
+| `VerifySelf()` | any uid (self only) | `(matched, reason, best, rgb_png, ir_png)` — one capture against the caller's own templates; never opens a camera when they have none |
+
+Self-enrollment authorization: a non-root caller may begin an
+enrollment only for their own uid, and only after the daemon gets a
+polkit `CheckAuthorization` for action
+`org.zdr.Authenticator.Enroll` (shipped in
+`packaging/polkit/`, `auth_self`). The session binds to the caller's
+unique bus name; later enrollment calls accept only that caller (or
+uid 0). `TemplateInfo` and `VerifySelf` take no user argument at
+all — the daemon derives the target from the caller's uid, so there
+is nothing to forge. `VerifySelf` journal-logs every call
+(`zdrd: VerifySelf …`) since it opens cameras for non-root callers.
 
 Signals: `AuthRequested(id, user, service, tty, label)` and
 `AuthFeedback(id, kind, message)` with kinds `capturing`, `no-face`,

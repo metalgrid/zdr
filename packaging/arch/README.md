@@ -26,23 +26,28 @@ Skip tests with `makepkg --nocheck -si` when you need a faster build.
 |---|---|
 | Daemon | `/usr/bin/zdrd` |
 | Session agent | `/usr/bin/zdr-agent` |
+| Enrollment GUI | `/usr/bin/zdr-enroll` (+ desktop entry, `/usr/share/polkit-1/actions/org.zdr.Authenticator.policy`) |
 | PAM module | `/usr/lib/security/pam_zdr.so` |
 | Models | `/usr/share/zdr/models/` |
 | D-Bus policy | `/usr/share/dbus-1/system.d/org.zdr.Authenticator.conf` |
 | D-Bus activation | `/usr/share/dbus-1/system-services/org.zdr.Authenticator.service` |
 | systemd unit | `/usr/lib/systemd/system/zdrd.service` |
 | Agent user service | `/usr/lib/systemd/user/zdr-agent.service` (enable with `systemctl --user enable --now zdr-agent.service`) |
-| Template dir | `/var/lib/zdr/<user>/ir*.png` (mode 0700) |
+| Template dir | `/var/lib/zdr/<user>/templates.bin` (dir `0700`, file `0600`) |
+| Config | `/etc/zdr/zdrd.toml` |
 
-The camera paths in the daemon default to this machine's by-path nodes.
-Edit the unit if your cameras land elsewhere.
+Cameras auto-detect by V4L2 format at daemon start. Pin paths in
+`/etc/zdr/zdrd.toml` only if detection picks wrong.
 
 ## First run
 
 Follow the printed post-install steps. In short:
 
-1. `systemctl enable --now zdrd.service`
-2. Enroll 3-5 IR captures as `/var/lib/zdr/$USER/ir*.png`.
-3. Re-login so the agent starts, then test with `pamtester`.
+1. `sudo systemctl enable --now zdrd.service`
+2. `systemctl --user enable --now zdr-agent.service`
+3. Enroll with `zdr-enroll` (GUI) or `sudo zdrctl enroll`, then test
+   with the app's **Test my face** or with `pamtester`.
 4. Only after that passes, add `auth sufficient pam_zdr.so` as the first
    line of `/etc/pam.d/sudo`, with a root shell held open.
+
+The full walk-through lives in [`../../docs/manual-setup.md`](../../docs/manual-setup.md).

@@ -67,6 +67,18 @@ easily, both fail IR). Treat it as a doorbell, not a lock.
 
 ## Enroll
 
+Two front-ends, same daemon machinery:
+
+- **GUI:** run `zdr-enroll` (or launch "Face Enrollment (zdr)").
+  It opens on your status (template count and mode, sealed password
+  yes/no), asks polkit for your password once before enrolling
+  (your desktop's normal auth panel), then takes five guided
+  captures with live RGB/IR previews and plain-language guidance.
+  **Test my face** runs one capture against your own templates and
+  shows the judged stills with the match score. **Re-enroll**
+  replaces the current set and asks for confirmation first.
+- **CLI:** the same flow from a terminal:
+
 ```sh
 sudo zdrctl enroll            # five guided captures, quality gated
 sudo zdrctl list              # root-only store: /var/lib/zdr/<user>/

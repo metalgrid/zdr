@@ -41,7 +41,9 @@ accidentally approve anything.
 
 Under the hood there are four small pieces — a root daemon that owns
 the cameras, a PAM module, a little session agent that shows the
-prompt, and `zdrctl` for enrollment. The matching itself is YuNet +
+prompt, and `zdrctl` — plus a small `zdr-enroll` GUI if you'd rather
+click through enrollment and test your face from the same window.
+The matching itself is YuNet +
 SFace over ONNX, checked on both the normal webcam **and** the IR
 camera. That second sensor matters: when I tested, a printed photo
 and a phone photo both sailed through the RGB camera and both got
@@ -68,7 +70,8 @@ place where a typo can ruin your afternoon. The short version:
 ```sh
 cd packaging/arch && makepkg -si
 sudo systemctl enable --now zdrd.service
-sudo zdrctl enroll
+systemctl --user enable --now zdr-agent.service
+zdr-enroll            # or: sudo zdrctl enroll
 ```
 
 If you want the guts — the consent protocol, the D-Bus contract, why
