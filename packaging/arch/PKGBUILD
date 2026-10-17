@@ -41,6 +41,16 @@ build() {
     g++ -std=c++17 -fPIC -O2 zdr-agent/prompt/main.cpp -o zdr-prompt \
         $(pkg-config --cflags --libs Qt6Quick Qt6Gui Qt6Qml Qt6Core) \
         $layershell_libs
+
+    # Optional zdr-enroll GUI (Qt6 + QtDBus; needs moc for its backend
+    # QObject). Same optional-at-runtime shape as the prompt host:
+    # built when qt6-declarative is present at build time (makedepends),
+    # useless-but-harmless on a Qt-less system.
+    mkdir -p zdr-enroll-build
+    /usr/lib/qt6/moc zdr-enroll/main.cpp -o zdr-enroll-build/main.moc
+    g++ -std=c++17 -fPIC -O2 -Izdr-enroll-build zdr-enroll/main.cpp -o zdr-enroll-bin \
+        $(pkg-config --cflags --libs Qt6Quick Qt6Gui Qt6Qml Qt6Core Qt6DBus) \
+        $layershell_libs
 }
 
 check() {
@@ -57,6 +67,13 @@ package() {
     install -Dm755 zdr-prompt "$pkgdir/usr/lib/zdr/zdr-prompt"
     install -Dm644 zdr-agent/prompt/zdr-prompt.qml \
         "$pkgdir/usr/share/zdr/zdr-prompt.qml"
+    install -Dm755 zdr-enroll-bin "$pkgdir/usr/bin/zdr-enroll"
+    install -Dm644 zdr-enroll/zdr-enroll.qml \
+        "$pkgdir/usr/share/zdr/zdr-enroll.qml"
+    install -Dm644 zdr-enroll/zdr-enroll.desktop \
+        "$pkgdir/usr/share/applications/zdr-enroll.desktop"
+    install -Dm644 packaging/polkit/org.zdr.Authenticator.policy \
+        "$pkgdir/usr/share/polkit-1/actions/org.zdr.Authenticator.policy"
 
     install -Dm644 "$srcdir/face_detection_yunet_2023mar.onnx" \
         "$pkgdir/usr/share/zdr/models/face_detection_yunet_2023mar.onnx"
