@@ -12,7 +12,7 @@
 
 use crate::consent::Caller;
 use std::collections::HashMap;
-use zbus::zvariant::{OwnedValue, Value};
+use zbus::zvariant::Value;
 use zbus::Connection;
 
 pub const AUTHORITY_BUS_NAME: &str = "org.freedesktop.PolicyKit1";
@@ -82,11 +82,14 @@ impl std::error::Error for AccessDenied {}
 /// The full `CheckAuthorization` argument tuple:
 /// `(subject, action_id, details, flags, cancellation_id)` where the
 /// subject is `(kind, details)` = `("system-bus-name", {"name": ..})`,
-/// i.e. zvariant signature `((sa{sv})sa{sv}us)`.
+/// i.e. zvariant signature `((sa{sv})sa{ss}us)`. Note the details
+/// dictionaries differ: the subject's is `a{sv}`, the call's `a{ss}`
+/// (mixing these up is an InvalidArgs from the authority — seen live
+/// 2026-10-17).
 pub type CheckAuthorizationArgs<'a> = (
     (&'a str, HashMap<&'a str, Value<'a>>),
     &'a str,
-    HashMap<&'a str, Value<'a>>,
+    HashMap<&'a str, &'a str>,
     u32,
     &'a str,
 );
@@ -126,7 +129,7 @@ pub async fn check_enroll_on_bus(conn: &Connection, caller_name: &str) -> bool {
     };
     let args = check_authorization_args(caller_name);
     match proxy
-        .call::<_, _, (bool, bool, HashMap<String, OwnedValue>)>("CheckAuthorization", &args)
+        .call::<_, _, (bool, bool, HashMap<String, String>)>("CheckAuthorization", &args)
         .await
     {
         Ok((is_authorized, _is_challenge, _details)) => is_authorized,
@@ -225,7 +228,7 @@ mod tests {
         let args = check_authorization_args(":1.42");
         // Exact zvariant signature of the whole argument tuple.
         use zbus::zvariant::DynamicType;
-        assert_eq!(args.signature().to_string(), "((sa{sv})sa{sv}us)");
+        assert_eq!(args.signature().to_string(), "((sa{sv})sa{ss}us)");
         let (subject, action_id, details, flags, cancellation_id) = &args;
         assert_eq!(subject.0, "system-bus-name");
         assert_eq!(subject.1.len(), 1);
