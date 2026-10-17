@@ -31,7 +31,7 @@ Skip tests with `makepkg --nocheck -si` when you need a faster build.
 | D-Bus policy | `/usr/share/dbus-1/system.d/org.zdr.Authenticator.conf` |
 | D-Bus activation | `/usr/share/dbus-1/system-services/org.zdr.Authenticator.service` |
 | systemd unit | `/usr/lib/systemd/system/zdrd.service` |
-| Agent autostart | `/etc/xdg/autostart/zdr-agent.desktop` |
+| Agent user service | `/usr/lib/systemd/user/zdr-agent.service` (enable with `systemctl --user enable --now zdr-agent.service`) |
 | Template dir | `/var/lib/zdr/<user>/ir*.png` (mode 0700) |
 
 The camera paths in the daemon default to this machine's by-path nodes.

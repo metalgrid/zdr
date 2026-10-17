@@ -86,8 +86,8 @@ package() {
         "$pkgdir/usr/share/dbus-1/system-services/org.zdr.Authenticator.service"
     install -Dm644 packaging/arch/zdrd.service \
         "$pkgdir/usr/lib/systemd/system/zdrd.service"
-    install -Dm644 packaging/arch/zdr-agent.desktop \
-        "$pkgdir/etc/xdg/autostart/zdr-agent.desktop"
+    install -Dm644 packaging/arch/zdr-agent.service \
+        "$pkgdir/usr/lib/systemd/user/zdr-agent.service"
     install -Dm644 packaging/arch/zdr.tmpfiles \
         "$pkgdir/usr/lib/tmpfiles.d/zdr.conf"
     install -Dm644 zdrd/zdrd.toml.example "$pkgdir/etc/zdr/zdrd.toml"

@@ -74,8 +74,9 @@ sudo zdrctl enroll-password   # optional: seal the login password to the TPM
 sudo zdrctl remove <user>     # delete templates and any sealed password
 ```
 
-The agent starts from `/etc/xdg/autostart/zdr-agent.desktop` at login.
-Until you re-login, start it once by hand: `zdr-agent &`.
+The agent is a systemd **user** service (it refuses to run as
+root or as a system service). Enable it once per user:
+`systemctl --user enable --now zdr-agent.service`.
 
 ## Test before you touch a real service
 

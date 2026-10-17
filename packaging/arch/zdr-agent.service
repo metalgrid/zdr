@@ -1,0 +1,14 @@
+[Unit]
+Description=zdr face authentication consent agent
+Documentation=file:///usr/share/doc/zdr/README.md
+After=graphical-session.target
+PartOf=graphical-session.target
+ConditionUser=!@system
+
+[Service]
+ExecStart=/usr/bin/zdr-agent
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

@@ -604,6 +604,14 @@ fn main() {
         })
         .expect("spawning the shutdown watcher cannot fail");
 
+    // Never a system service: this agent answers consent prompts for a
+    // desktop session and must run as that session's user. Refuse root
+    // outright, so even a unit copied into system scope cannot operate.
+    if own_uid() == 0 {
+        eprintln!("zdr-agent: refusing to run as root; run it as a systemd user service (systemctl --user enable --now zdr-agent.service)");
+        std::process::exit(1);
+    }
+
     // Our identity comes from getuid/getpwuid, never from $USER:
     // the request filter is only meaningful against the passwd
     // entry for the uid this process actually runs as.
