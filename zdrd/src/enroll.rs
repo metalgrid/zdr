@@ -118,8 +118,9 @@ impl Enrollments {
         }
     }
 
-    /// Begin a session bound to an implicit root caller. Kept for the
-    /// pre-GUI callers/tests; the D-Bus layer uses `begin_with_caller`.
+    /// Begin a session bound to an implicit root caller. Retained
+    /// for tests; the D-Bus layer uses `begin_with_caller`.
+    #[cfg(test)]
     pub fn begin(&mut self, enroll_id: &str, user: &str, now: Instant) -> Result<(), EnrollError> {
         self.begin_with_caller(
             enroll_id,
@@ -160,6 +161,7 @@ impl Enrollments {
     }
 
     /// The caller recorded when this session began.
+    #[cfg(test)]
     pub fn caller_for(&mut self, enroll_id: &str, now: Instant) -> Result<Caller, EnrollError> {
         Ok(self.live(enroll_id, now)?.caller.clone())
     }
