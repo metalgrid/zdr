@@ -7,18 +7,26 @@ say it may.
 
 ## Why this exists
 
-I wrote the first version of this years ago as a toy: something ran
-`sudo`, the camera snapped a picture, and if it was my face, it went
-through. It worked, and it creeped me out. If I'm sitting at the
-laptop anyway — and I usually am — then anything that manages to run
-`sudo` gets authenticated as me, whether I wanted it or not. That's
-why the project died.
+The first version of this actually worked, after a fashion. It was
+built on dlib, and dlib — at camera resolution, the way I drove it —
+was heavy, slow, and ate RAM like it was being paid by the gigabyte.
+The cameras fought back too, and I never got the IR side working
+properly. Eventually I shelved the whole thing.
 
-This rewrite is built around fixing exactly that. Nothing scans your
-face because a process asked nicely. You get a prompt first: *this
-thing wants authentication — scan?* You click yes or no. Only then
-does a camera open. The face is the credential; the click is the
-intent, and I never want the two confused.
+There was a second thing that bothered me even back then: something
+ran `sudo`, the camera snapped a picture, and if it was my face, it
+went through. If I'm sitting at the laptop anyway — and I usually
+am — then anything that manages to run `sudo` gets authenticated as
+me, whether I wanted it or not.
+
+This resurrection fixes both. The engine is two small ONNX models
+instead of dlib (milliseconds now, not seconds; the numbers are in
+the docs), the IR camera is a first-class citizen, and the consent
+part is non-negotiable: nothing scans your face because a process
+asked nicely. You get a prompt first — *this thing wants
+authentication — scan?* — and only your yes opens a camera. The face
+is the credential; the click is the intent, and I never want the
+two confused.
 
 ## So what happens when I run sudo
 
