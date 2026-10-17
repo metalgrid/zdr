@@ -29,6 +29,63 @@ below); verify refuses cross-mode matching with reason `nomatch`.
 read-only method any uid may call; it is how `zdrctl` learns the
 mode above.
 
+## D-Bus methods (`org.zdr.Authenticator`)
+
+| Method | Caller | Returns |
+| --- | --- | --- |
+| `RegisterAgent()` | any uid | `()` |
+| `BeginAuth(user, service, tty, label)` | root | `(request_id, channel)` |
+| `Respond(request_id, approved)` | root, or the registered agent for that user | `()` |
+| `AwaitConsent(request_id)` | root | `outcome` |
+| `CaptureVerify(request_id)` | root | `(matched, reason)` |
+| `CaptureVerifyAuthtok(request_id)` | root | `(matched, reason, password)` |
+| `Cancel(request_id)` | root | `()` |
+| `ServerInfo()` | any uid | `(version, require_ir)` |
+| `TemplateInfo()` | any uid (self only, see below) | `(count, mode, has_sealed)` |
+| `VerifySelf()` | any uid (self only, see below) | `(matched, reason, best, rgb_png, ir_png)` |
+| `BeginEnroll(user)` | root, or the target user after a polkit check | `(enroll_id)` |
+| `EnrollCapture(enroll_id)` | session caller or root | `(state, captured, needed, kind)` |
+| `EnrollCaptureWithPreview(enroll_id)` | session caller or root | `(state, captured, needed, kind, rgb_png, ir_png)` |
+| `FinishEnroll(enroll_id)` | session caller or root | `(stored)` |
+| `CancelEnroll(enroll_id)` | session caller or root | `()` |
+| `EnrollPassword(user, password)` | root | `()` |
+| `HasSealedPassword(user)` | any uid | `(has)` |
+
+Signals: `AuthRequested(request_id, user, service, tty, label)` and
+`AuthFeedback(request_id, kind, message)` (see "Feedback signal").
+
+## Self-service: `TemplateInfo` and `VerifySelf`
+
+These two methods let the enrollment GUI show a user their own
+status and let them test their own face enrollment. Neither takes
+a user argument: the target is derived from the caller's uid via
+the `/etc/passwd` lookup (uid → login name; uid 0 resolves to
+`root` like anyone else), so a caller can only ever describe or
+test themselves. A caller uid with no passwd entry gets
+`AccessDenied`.
+
+`TemplateInfo` is read-only: `count` templates, `mode` `"ir"` or
+`"rgb"` from the stored templates (`"none"` when `count` is 0),
+and `has_sealed` for whether a sealed password file exists.
+
+`VerifySelf` is the GUI's "test my face" button. The button press
+is the consent — there is no separate consent prompt or request.
+If the caller has no templates it returns
+`(false, "nomatch", 0.0, [], [])` and *never opens a camera*.
+Otherwise it runs exactly one capture through the normal verify
+pipeline (mode-mismatch refusal, cross-sensor gates, threshold),
+returns the best cosine as `best` (`matched = best >= threshold`),
+the usual reason string, and PNG stills of the judged frames
+(empty on camera/engine failure; `ir_png` empty in RGB-only mode).
+During the capture it emits `AuthFeedback` with request_id
+`"self-test"` (`capturing` plus exactly one terminal kind). Every
+call is journal-logged for auditability, since this method opens
+cameras for non-root callers:
+
+```
+zdrd: VerifySelf user=<name> matched=<true|false> best=<cosine>
+```
+
 ## AUTHTOK: TPM-sealed password release (Step 15)
 
 What is sealed: the user's *actual login password*, sealed by
