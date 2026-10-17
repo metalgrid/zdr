@@ -12,7 +12,10 @@
 //! - `Cancel(request_id) -> ()`
 //! - `BeginEnroll(user) -> (enroll_id)`, `EnrollCapture(enroll_id) ->
 //!   (state, captured, needed, kind)`, `FinishEnroll(enroll_id) ->
-//!   (stored)`, `CancelEnroll(enroll_id) -> ()` — root only (Step 11)
+//!   (stored)`, `CancelEnroll(enroll_id) -> ()` — uid 0, or the
+//!   target user themselves after a polkit check on BeginEnroll
+//!   (action `org.zdr.Authenticator.Enroll`); a session is bound to
+//!   the caller that began it (see `enroll.rs`/`polkit.rs`)
 //! - `ServerInfo() -> (version, require_ir)` — read-only, any uid,
 //!   no side effects (Step 14; the only contract addition)
 //! - `EnrollPassword(user, password) -> ()` — root only (Step 15);
@@ -226,6 +229,25 @@ impl Authenticator {
         }
     }
 
+    /// Authorize use of an existing enrollment session: uid 0 always
+    /// may; a non-root caller must be the exact caller recorded by
+    /// `BeginEnroll` for this session.
+    async fn require_session_caller(
+        &self,
+        conn: &Connection,
+        header: &Header<'_>,
+        enroll_id: &str,
+    ) -> Result<Caller, AuthError> {
+        let who = caller(conn, header).await?;
+        if who.uid == 0 {
+            return Ok(who);
+        }
+        self.lock_enrollments()?
+            .check_caller(enroll_id, &who, Instant::now())
+            .map_err(enroll_error)?;
+        Ok(who)
+    }
+
     fn lock_enrollments(&self) -> Result<std::sync::MutexGuard<'_, Enrollments>, AuthError> {
         self.enrollments
             .lock()
@@ -276,6 +298,15 @@ async fn caller(conn: &Connection, header: &Header<'_>) -> Result<Caller, AuthEr
         .map(|s| s.as_str().to_string())
         .unwrap_or_default();
     Ok(Caller { sender, uid })
+}
+
+/// Map an enrollment state-machine error onto the bus error contract.
+fn enroll_error(e: EnrollError) -> AuthError {
+    match e {
+        EnrollError::Busy => AuthError::Busy(e.to_string()),
+        EnrollError::AccessDenied => AuthError::AccessDenied(e.to_string()),
+        e => AuthError::Failed(e.to_string()),
+    }
 }
 
 /// Look up a user's uid in /etc/passwd (service-layer helper; the consent
@@ -758,21 +789,45 @@ impl Authenticator {
         #[zbus(header)] header: Header<'_>,
         #[zbus(connection)] conn: &Connection,
     ) -> Result<String, AuthError> {
-        require_root(conn, &header).await?;
-        if !crate::templates::valid_user(user) || uid_for_user(user).is_none() {
+        let who = caller(conn, &header).await?;
+        let target_uid = uid_for_user(user);
+        if !crate::templates::valid_user(user) || target_uid.is_none() {
             return Err(AuthError::InvalidArgs(format!("unknown user {user:?}")));
         }
+        // Authorization: uid 0 (root flow, no polkit), or the target
+        // user themselves with a polkit approval. The polkit call is
+        // only made for a non-root self-enrollment; the pure decision
+        // in `authorize_begin` re-checks every condition and never
+        // consults its checker for root or another user's enrollment.
+        let polkit_ok = if who.uid != 0 && target_uid == Some(who.uid) {
+            crate::polkit::check_enroll_on_bus(conn, &who.sender).await
+        } else {
+            false
+        };
+        crate::polkit::authorize_begin(
+            &who,
+            target_uid,
+            &crate::polkit::FixedPolkit(polkit_ok),
+        )
+        .map_err(|_| {
+            AuthError::AccessDenied(format!(
+                "caller uid {} may not enroll user {user}",
+                who.uid
+            ))
+        })?;
         let enroll_id = new_request_id()?;
         match self
             .lock_enrollments()?
-            .begin(&enroll_id, user, Instant::now())
+            .begin_with_caller(&enroll_id, user, Instant::now(), &who)
         {
             Ok(()) => {
-                eprintln!("zdrd: BeginEnroll user={user} id={enroll_id}");
+                eprintln!(
+                    "zdrd: BeginEnroll user={user} id={enroll_id} caller={} uid={}",
+                    who.sender, who.uid
+                );
                 Ok(enroll_id)
             }
-            Err(EnrollError::Busy) => Err(AuthError::Busy(EnrollError::Busy.to_string())),
-            Err(e) => Err(AuthError::Failed(e.to_string())),
+            Err(e) => Err(enroll_error(e)),
         }
     }
 
@@ -784,7 +839,7 @@ impl Authenticator {
         #[zbus(connection)] conn: &Connection,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> Result<(String, i32, i32, String), AuthError> {
-        require_root(conn, &header).await?;
+        self.require_session_caller(conn, &header, enroll_id).await?;
         // Snapshot session state, then capture without holding the
         // enrollment lock across blocking camera work.
         let (user, existing, captured_before) = {
@@ -874,7 +929,7 @@ impl Authenticator {
         #[zbus(connection)] conn: &Connection,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> Result<i32, AuthError> {
-        require_root(conn, &header).await?;
+        self.require_session_caller(conn, &header, enroll_id).await?;
         let (user, embeddings) = self
             .lock_enrollments()?
             .ready_snapshot(enroll_id, Instant::now())
@@ -897,7 +952,19 @@ impl Authenticator {
         #[zbus(header)] header: Header<'_>,
         #[zbus(connection)] conn: &Connection,
     ) -> Result<(), AuthError> {
-        require_root(conn, &header).await?;
+        let who = caller(conn, &header).await?;
+        if who.uid != 0 {
+            // Bound-caller check, except that cancelling an unknown
+            // or expired session stays an idempotent no-op (there is
+            // no session left to protect).
+            match self
+                .lock_enrollments()?
+                .check_caller(enroll_id, &who, Instant::now())
+            {
+                Ok(()) | Err(EnrollError::Unknown) | Err(EnrollError::Expired) => {}
+                Err(e) => return Err(enroll_error(e)),
+            }
+        }
         let removed = self.lock_enrollments()?.cancel(enroll_id);
         eprintln!("zdrd: CancelEnroll id={enroll_id} removed={removed}");
         Ok(())

@@ -8,6 +8,7 @@ mod engine;
 mod enroll;
 mod error;
 mod feedback;
+mod polkit;
 mod seal;
 mod service;
 mod templates;
