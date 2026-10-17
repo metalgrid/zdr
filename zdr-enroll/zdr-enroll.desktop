@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Face Enrollment (zdr)
+Comment=Enroll your face for zdr face authentication
+Exec=zdr-enroll
+Icon=face-smile
+Terminal=false
+Categories=Settings;Security;
+Keywords=face;enroll;authentication;zdr;
