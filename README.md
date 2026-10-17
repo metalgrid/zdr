@@ -13,11 +13,12 @@ was heavy, slow, and ate RAM like it was being paid by the gigabyte.
 The cameras fought back too, and I never got the IR side working
 properly. Eventually I shelved the whole thing.
 
-There was a second thing that bothered me even back then: something
-ran `sudo`, the camera snapped a picture, and if it was my face, it
-went through. If I'm sitting at the laptop anyway — and I usually
-am — then anything that manages to run `sudo` gets authenticated as
-me, whether I wanted it or not.
+There was a second thing that bothered me even back then: any
+background task could ask for authorization — a `curl | bash` that
+wants sudo, an updater, whatever — the camera would snap a picture,
+and if it was my face, it went through. If I'm sitting at the laptop
+anyway — and I usually am — then anything that manages to ask gets
+authenticated as me, whether I wanted it or not.
 
 This resurrection fixes both. The engine is two small ONNX models
 instead of dlib (milliseconds now, not seconds; the numbers are in
